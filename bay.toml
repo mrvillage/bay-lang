@@ -1,0 +1,9 @@
+[package]
+name = "bay"
+version = "0.1.0"
+
+[dependencies]
+one = { version = "0.1.0" }
+
+[dependencies.two]
+version = "0.1.0"
