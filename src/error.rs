@@ -23,9 +23,15 @@ pub enum CompileError {
     UnterminatedComment(Span),
     /// Arbitrary error with a message
     Error(Span, String),
+    /// Unimplemented feature
+    Unimplemented(Span, &'static str),
 }
 
 impl CompileError {
+    pub fn error(span: Span, msg: impl Into<String>) -> Self {
+        CompileError::Error(span, msg.into())
+    }
+
     pub fn log(&self) {
         match self {
             CompileError::ConfigNotFound => {
@@ -81,6 +87,9 @@ impl CompileError {
             },
             CompileError::Error(span, msg) => {
                 span.print(msg, crate::Level::Error);
+            },
+            CompileError::Unimplemented(span, msg) => {
+                span.print(format!("unimplemented: {}", msg), crate::Level::Error);
             },
         }
     }

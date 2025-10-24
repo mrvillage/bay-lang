@@ -4,7 +4,7 @@ fn test() {
     let x = if true {
         f.value
     } else {
-        nil
+        {new Node { value: 1 }}.value
     };
 }
 

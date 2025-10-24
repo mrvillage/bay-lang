@@ -1630,8 +1630,8 @@ impl Value {
 
     pub fn infer(&mut self) -> Result<()> {
         match self {
-            Value::Const { .. } => {
-                unimplemented!("constant types are not yet implemented");
+            Value::Const { name, .. } => {
+                return Err(CompileError::Unimplemented(name.span, "constants"));
             },
             Value::Var { .. } => {
                 // variable types get inferred by their use
@@ -1704,8 +1704,8 @@ impl Value {
 
     pub fn check_ownership(&mut self) -> Result<()> {
         match self {
-            Value::Const { .. } => {
-                unimplemented!("constants are not yet implemented");
+            Value::Const { name, .. } => {
+                return Err(CompileError::Unimplemented(name.span, "constants"));
             },
             Value::Var { .. } => {
                 // variables have no ownership rules

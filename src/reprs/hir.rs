@@ -1708,12 +1708,8 @@ impl Literal {
                 }
                 Ok(!ty.is_inferred())
             },
-            Literal::String { .. } => {
-                unimplemented!("strings are not yet implemented");
-            },
-            Literal::Char { .. } => {
-                unimplemented!("chars are not yet implemented");
-            },
+            Literal::String { span, .. } => Err(CompileError::Unimplemented(*span, "strings")),
+            Literal::Char { span, .. } => Err(CompileError::Unimplemented(*span, "chars")),
         }
     }
 
@@ -2008,10 +2004,16 @@ impl Expr {
                         ty,
                         span,
                     } => {
-                        unimplemented!("unnamed struct expressions are not yet implemented");
+                        return Err(CompileError::Unimplemented(
+                            *span,
+                            "unnamed struct expressions",
+                        ));
                     },
                     StructExpr::Unit { path, ty, span } => {
-                        unimplemented!("unit struct expressions are not yet implemented");
+                        return Err(CompileError::Unimplemented(
+                            *span,
+                            "unit struct expressions",
+                        ));
                     },
                 }
             },
@@ -2027,7 +2029,7 @@ impl Expr {
                 ty,
                 span,
             } => {
-                unimplemented!("match expressions are not yet implemented");
+                return Err(CompileError::Unimplemented(*span, "match expressions"));
             },
             Expr::Loop {
                 label,
@@ -2055,7 +2057,7 @@ impl Expr {
                 ty,
                 span,
             } => {
-                unimplemented!("for loops are not yet implemented");
+                return Err(CompileError::Unimplemented(*span, "for loops"));
             },
             Expr::While {
                 label,
@@ -2276,11 +2278,6 @@ impl Expr {
                                         ));
                                     }
                                 },
-                                _ => {
-                                    unimplemented!(
-                                        "compound assignment operators are not yet implemented"
-                                    );
-                                },
                             }
                         }
                     },
@@ -2299,7 +2296,7 @@ impl Expr {
                 ty,
                 span,
             } => {
-                unimplemented!("range expressions are not yet implemented");
+                return Err(CompileError::Unimplemented(*span, "range expressions"));
             },
             Expr::BinaryOp {
                 left,
@@ -2409,7 +2406,7 @@ impl Expr {
                 ty,
                 span,
             } => {
-                unimplemented!("method calls are not yet implemented");
+                return Err(CompileError::Unimplemented(*span, "method calls"));
             },
             Expr::Call {
                 func,
@@ -2549,22 +2546,28 @@ impl Expr {
                             ));
                         }
                     },
-                    StructExpr::Unnamed { .. } => {
-                        unimplemented!("unnamed struct expressions are not yet implemented");
+                    StructExpr::Unnamed { span, .. } => {
+                        return Err(CompileError::Unimplemented(
+                            *span,
+                            "unnamed struct expressions",
+                        ));
                     },
-                    StructExpr::Unit { .. } => {
-                        unimplemented!("unit struct expressions are not yet implemented");
+                    StructExpr::Unit { span, .. } => {
+                        return Err(CompileError::Unimplemented(
+                            *span,
+                            "unit struct expressions",
+                        ));
                     },
                 }
             },
             Expr::Block(block) => block.check_fully_resolved()?,
             Expr::If(expr) => expr.check_fully_resolved()?,
             Expr::Match { arms, span, .. } => {
-                unimplemented!("match expressions are not yet implemented");
+                return Err(CompileError::Unimplemented(*span, "match expressions"));
             },
             Expr::Loop { body, span, .. } => body.check_fully_resolved()?,
             Expr::For { body, span, .. } => {
-                unimplemented!("for loops are not yet implemented");
+                return Err(CompileError::Unimplemented(*span, "for loops"));
             },
             Expr::While { body, span, .. } => body.check_fully_resolved()?,
             Expr::ControlFlow { span, expr, .. } => {
@@ -2574,7 +2577,7 @@ impl Expr {
             },
             Expr::Assign { expr, span, .. } => expr.check_fully_resolved()?,
             Expr::Range { ty, span, .. } => {
-                unimplemented!("range expressions are not yet implemented");
+                return Err(CompileError::Unimplemented(*span, "range expressions"));
             },
             Expr::BinaryOp {
                 left,
@@ -2808,14 +2811,17 @@ impl Expr {
                 moveset = expr.check_ownership(moveset)?;
             },
             Expr::Match { .. } => {
-                unimplemented!("match expressions are not yet implemented");
+                return Err(CompileError::Unimplemented(
+                    self.span(),
+                    "match expressions",
+                ));
             },
             Expr::Loop { body, .. } => {
                 moveset.new_value();
                 moveset = body.check_ownership(moveset)?;
             },
             Expr::For { .. } => {
-                unimplemented!("for loops are not yet implemented");
+                return Err(CompileError::Unimplemented(self.span(), "for loops"));
             },
             Expr::While {
                 condition, body, ..
@@ -2834,7 +2840,7 @@ impl Expr {
             Expr::ControlFlow { expr, kind, .. } => {
                 if let Some(e) = expr {
                     if let ControlFlowKind::Break = kind {
-                        unimplemented!("break with value is not yet implemented");
+                        return Err(CompileError::Unimplemented(e.span(), "break with value"));
                     }
                     moveset.new_value();
                     moveset = e.check_ownership(moveset, true)?;
@@ -2880,7 +2886,10 @@ impl Expr {
                 moveset.new_value();
             },
             Expr::Range { .. } => {
-                unimplemented!("range expressions are not yet implemented");
+                return Err(CompileError::Unimplemented(
+                    self.span(),
+                    "range expressions",
+                ));
             },
             Expr::BinaryOp { left, right, .. } => {
                 moveset.new_value();
@@ -2941,11 +2950,14 @@ impl Expr {
                         }
                     }
                 } else {
-                    unimplemented!("field access on non-value expressions is not yet implemented");
+                    return Err(CompileError::Unimplemented(
+                        *span,
+                        "field access on non-value expressions",
+                    ));
                 }
             },
             Expr::MethodCall { expr, args, .. } => {
-                unimplemented!("method calls are not yet implemented");
+                return Err(CompileError::Unimplemented(self.span(), "method calls"));
             },
             Expr::Index {
                 expr, index, ty, ..
@@ -2964,9 +2976,10 @@ impl Expr {
                             "cannot move out of array".to_string(),
                         ));
                     } else {
-                        unimplemented!(
-                            "borrowing from arrays of non-copy types is not yet implemented"
-                        );
+                        return Err(CompileError::Unimplemented(
+                            expr.span(),
+                            "borrowing from arrays of non-copy types",
+                        ));
                     }
                 }
             },
