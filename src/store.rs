@@ -1,41 +1,80 @@
 use core::str;
+use std::sync::atomic::AtomicU64;
 
 use dashmap::DashMap;
 
 use crate::prelude::*;
 
-pub static mut FILE_STORE: Option<FileStore> = None;
-
-pub struct FileStore {
-    pub files: DashMap<u64, (std::path::PathBuf, String)>,
+pub struct Store<T: InitStore> {
+    pub items:   DashMap<u64, T>,
+    pub next_id: AtomicU64,
 }
 
-impl FileStore {
+pub trait InitStore
+where Self: Sized
+{
+    fn init_store(store: &mut Store<Self>);
+}
+
+impl<T> Store<T>
+where T: InitStore
+{
     pub fn new() -> Self {
-        Self {
-            files: DashMap::new(),
+        let mut store = Self {
+            items:   DashMap::new(),
+            next_id: AtomicU64::new(0),
+        };
+        T::init_store(&mut store);
+        store
+    }
+
+    pub fn all(&self) -> Vec<&'static T> {
+        unsafe {
+            let mut items = Vec::with_capacity(self.items.len());
+            for item in self.items.iter() {
+                items.push(&*(&*item as *const T));
+            }
+            items
         }
     }
 
-    pub fn add_file(&mut self, path: std::path::PathBuf, content: String) -> u64 {
-        let id = rand::random::<u64>();
-        self.files.insert(id, (path, content));
-        id
+    pub fn all_mut(&self) -> Vec<&'static mut T> {
+        unsafe {
+            let mut items = Vec::with_capacity(self.items.len());
+            for mut item in self.items.iter_mut() {
+                items.push(&mut *(&mut *item as *mut T));
+            }
+            items
+        }
     }
+}
 
-    pub fn get_path(&self, id: u64) -> &std::path::Path {
-        self.files
-            .get(&id)
-            .map(|x| unsafe { &*(x.0.as_path() as *const std::path::Path) })
-            .expect("File not found")
+impl<T> Default for Store<T>
+where T: InitStore
+{
+    fn default() -> Self {
+        Self::new()
     }
+}
 
-    pub fn get_content(&self, id: u64) -> &'static str {
-        self.files
+pub static mut FILE_STORE: Option<Store<(std::path::PathBuf, String)>> = None;
+
+impl InitStore for (std::path::PathBuf, String) {
+    fn init_store(store: &mut Store<Self>) {
+        let default_file = std::path::PathBuf::from("stdin");
+        store.items.insert(0, (default_file, String::new()));
+        store.next_id.store(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+pub fn get_file_content(id: u64) -> &'static str {
+    unsafe {
+        FILE_STORE
+            .as_ref()
+            .unwrap()
+            .items
             .get(&id)
-            .map(|x| unsafe {
-                str::from_utf8_unchecked(std::slice::from_raw_parts(x.1.as_ptr(), x.1.len()))
-            })
+            .map(|x| str::from_utf8_unchecked(std::slice::from_raw_parts(x.1.as_ptr(), x.1.len())))
             .expect("File not found")
     }
 }
@@ -44,15 +83,23 @@ pub fn add_file(path: impl Into<std::path::PathBuf>) -> Result<(u64, &'static st
     let path = path.into();
     let content = std::fs::read_to_string(&path)?;
     unsafe {
-        let id = FILE_STORE.as_mut().unwrap().add_file(path, content);
-        Ok((id, FILE_STORE.as_ref().unwrap().get_content(id)))
+        let store = FILE_STORE.as_ref().unwrap();
+        let id = store
+            .next_id
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        store.items.insert(id, (path, content));
+        Ok((id, get_file_content(id)))
     }
 }
 
 pub fn get_file_path(id: u64) -> &'static std::path::Path {
-    unsafe { FILE_STORE.as_ref().unwrap().get_path(id) }
-}
-
-pub fn get_file_content(id: u64) -> &'static str {
-    unsafe { FILE_STORE.as_ref().unwrap().get_content(id) }
+    unsafe {
+        FILE_STORE
+            .as_ref()
+            .unwrap()
+            .items
+            .get(&id)
+            .map(|x| &*(x.0.as_path() as *const std::path::Path))
+            .expect("File not found")
+    }
 }

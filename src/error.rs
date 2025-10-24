@@ -1,3 +1,5 @@
+use crate::Span;
+
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum CompileError {
@@ -9,6 +11,18 @@ pub enum CompileError {
     InvalidConfig(&'static str),
     /// IO error
     IoError(std::io::Error),
+    /// Unexpected character
+    UnexpectedCharacter(Span, char),
+    /// Unexpected end of file
+    UnexpectedEndOfFile(Span, char),
+    /// Unexpected token
+    UnexpectedToken(Span, Option<String>),
+    /// Unexpected end of input
+    UnexpectedEndOfInput(Span),
+    /// Unterminated comment
+    UnterminatedComment(Span),
+    /// Arbitrary error with a message
+    Error(Span, String),
 }
 
 impl CompileError {
@@ -35,6 +49,38 @@ impl CompileError {
             },
             CompileError::IoError(err) => {
                 tracing::error!("io error: {}", err);
+            },
+            CompileError::UnexpectedCharacter(span, c) => {
+                span.print(format!("unexpected character '{}'", c), crate::Level::Error);
+            },
+            CompileError::UnexpectedEndOfFile(span, c) => {
+                span.print(
+                    if *c == '\0' {
+                        "unexpected end of file".to_string()
+                    } else {
+                        format!("unexpected end of file, expected '{}'", c)
+                    },
+                    crate::Level::Error,
+                );
+            },
+            CompileError::UnexpectedToken(span, expected) => {
+                span.print(
+                    if let Some(expected) = expected {
+                        format!("unexpected token, expected {}", expected)
+                    } else {
+                        "unexpected token".to_string()
+                    },
+                    crate::Level::Error,
+                );
+            },
+            CompileError::UnexpectedEndOfInput(span) => {
+                span.print("unexpected end of input", crate::Level::Error);
+            },
+            CompileError::UnterminatedComment(span) => {
+                span.print("unterminated comment", crate::Level::Error);
+            },
+            CompileError::Error(span, msg) => {
+                span.print(msg, crate::Level::Error);
             },
         }
     }

@@ -1,0 +1,14 @@
+fn test() {
+    let f = new Node { value: 1 };
+    let y = f.next;
+    let x = if true {
+        f.value
+    } else {
+        nil
+    };
+}
+
+struct Node {
+    value: i32,
+    next: Node?,
+}

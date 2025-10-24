@@ -1,5 +1,11 @@
 use crate::{error::CompileError, prelude::*};
 
+pub static mut CONFIG: Option<Config> = None;
+
+pub fn config() -> &'static Config {
+    unsafe { CONFIG.as_ref().unwrap() }
+}
+
 #[derive(Debug)]
 pub struct Config {
     package:          Package,
@@ -70,8 +76,7 @@ impl FromStr for Version {
             .parse::<u32>()
             .map_err(|_| CompileError::InvalidConfig("patch version must be a number"))?;
         let version = &version[third_period..];
-        let pre_release = if version.starts_with('-') {
-            let pre_release = &version[1..];
+        let pre_release = if let Some(pre_release) = version.strip_prefix('-') {
             // dot separated ascii letters, numbers, and dashes until a + or end of line
             let pre_release_end = pre_release.find('+').unwrap_or(pre_release.len());
             let pre_release = &pre_release[..pre_release_end];
@@ -100,8 +105,7 @@ impl FromStr for Version {
         } else {
             None
         };
-        let metadata = if version.starts_with('+') {
-            let metadata = &version[1..];
+        let metadata = if let Some(metadata) = version.strip_prefix('+') {
             // dot separated ascii letters, numbers, and dashes until end of line
             let split = metadata.split('.').collect::<Vec<_>>();
             for part in &split {
