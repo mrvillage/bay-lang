@@ -48,20 +48,21 @@ fn to_hir(source: concrete::Source) -> Result<&'static Scope> {
             scope:      pkg_root,
         },
     )?;
+    let scope = global_root.inherit_all()?;
     global_root.new_value(
         token::Ident {
             value: "print_i32",
             span:  Span::dummy(),
         },
         Value::Fn {
-            id:         PRINT_I32_VALUE_ID,
+            id: PRINT_I32_VALUE_ID,
             visibility: Visibility::Public,
-            name:       token::Ident {
+            name: token::Ident {
                 value: "print_i32",
                 span:  Span::dummy(),
             },
-            ret_ty:     MaybeType::Resolved(&Type::Unit),
-            params:     vec![(
+            ret_ty: MaybeType::Resolved(&Type::Unit),
+            params: vec![(
                 token::Ident {
                     value: "value",
                     span:  Span::dummy(),
@@ -69,13 +70,14 @@ fn to_hir(source: concrete::Source) -> Result<&'static Scope> {
                 MaybeType::Resolved(&Type::I32),
                 None,
             )],
-            body:       Box::new(hir::Block {
+            scope,
+            body: Box::new(hir::Block {
                 stmts: vec![],
-                span:  Span::dummy(),
-                ty:    MaybeType::Inferred,
-                scope: global_root.inherit_all()?,
+                span: Span::dummy(),
+                ty: MaybeType::Inferred,
+                scope,
             }),
-            ty:         MaybeType::Inferred,
+            ty: MaybeType::Inferred,
         },
     )?;
     // our package
@@ -91,21 +93,25 @@ fn item_to_scope(item: concrete::Item, scope: &'static Scope) -> Result<()> {
         concrete::Item::Use(item) => scope.add_use_item(item),
         // values
         concrete::Item::Fn(item) => {
-            scope.new_value(item.name.clone(), Value::Fn {
-                id:         0,
-                visibility: item.visibility.unwrap_or(Visibility::Private),
-                name:       item.name,
-                ret_ty:     match item.ret_ty {
-                    Some(ty) => MaybeType::Unresolved(ty, scope),
-                    None => MaybeType::Resolved(&Type::Unit),
-                },
-                params:     item
-                    .params
-                    .into_iter()
-                    .map(|param| (param.name, MaybeType::Unresolved(param.ty, scope), None))
-                    .collect(),
-                body:       Box::new(item.body.into_hir(scope)?),
-                ty:         MaybeType::Inferred,
+            scope.new_value(item.name.clone(), {
+                let scope = scope.inherit_all()?;
+                Value::Fn {
+                    id: 0,
+                    visibility: item.visibility.unwrap_or(Visibility::Private),
+                    name: item.name,
+                    ret_ty: match item.ret_ty {
+                        Some(ty) => MaybeType::Unresolved(ty, scope),
+                        None => MaybeType::Resolved(&Type::Unit),
+                    },
+                    params: item
+                        .params
+                        .into_iter()
+                        .map(|param| (param.name, MaybeType::Unresolved(param.ty, scope), None))
+                        .collect(),
+                    body: Box::new(item.body.into_hir(scope)?),
+                    scope,
+                    ty: MaybeType::Inferred,
+                }
             })?;
         },
         concrete::Item::Const(item) => {

@@ -307,7 +307,6 @@ impl Config {
 
     #[allow(dead_code)]
     pub fn to_toml(&self) -> Result<String> {
-        let mut toml = toml::map::Map::new();
         let mut package = toml::map::Map::new();
         package.insert(
             "name".to_string(),

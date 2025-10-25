@@ -105,7 +105,6 @@ pub fn codegen() -> Result<()> {
 (global $end (mut i32) (i32.const 65536))
 (global $tree_root (mut i32) (i32.const 0))
 (func $alloc (param $size i32) (result i32)
-  (local $allocated_ptr i32)
   ;; size should be at least 4 bytes (next)
   (if (i32.lt_u (local.get $size) (i32.const 4))
   (then (local.set $size (i32.const 4))))
@@ -133,8 +132,6 @@ pub fn codegen() -> Result<()> {
       (call $find_suitable_chunk (local.get $size))
     )
   )
-  (local.tee $allocated_ptr)
-  (call $print_i32 (local.get $allocated_ptr))
   return
 )
 (func $alloc_ptr (param $size i32) (result i32)

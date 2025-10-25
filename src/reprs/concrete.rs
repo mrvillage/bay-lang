@@ -357,6 +357,14 @@ pub enum UnaryExpr {
 
 #[derive(Debug, Clone)]
 pub enum FieldAccessExpr {
+    Unwrap {
+        expr: Box<FieldAccessExpr>,
+        span: Span,
+    },
+    Wrap {
+        expr: Box<FieldAccessExpr>,
+        span: Span,
+    },
     Index {
         array: Box<FieldAccessExpr>,
         index: Box<Expr>,

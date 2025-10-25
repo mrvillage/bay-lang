@@ -198,6 +198,16 @@ pub enum Expr {
         ty:   MaybeType,
         span: Span,
     },
+    Unwrap {
+        expr: Box<Expr>,
+        ty:   MaybeType,
+        span: Span,
+    },
+    Wrap {
+        expr: Box<Expr>,
+        ty:   MaybeType,
+        span: Span,
+    },
     Call {
         func: Box<Expr>,
         args: Vec<Expr>,
@@ -853,6 +863,20 @@ impl IntoHir for concrete::FieldAccessExpr {
 
     fn into_hir(self, scope: &'static Scope) -> Result<Self::Output> {
         match self {
+            concrete::FieldAccessExpr::Unwrap { expr, span } => {
+                Ok(Expr::Unwrap {
+                    expr: Box::new(expr.into_hir(scope)?),
+                    ty: MaybeType::Inferred,
+                    span,
+                })
+            },
+            concrete::FieldAccessExpr::Wrap { expr, span } => {
+                Ok(Expr::Wrap {
+                    expr: Box::new(expr.into_hir(scope)?),
+                    ty: MaybeType::Inferred,
+                    span,
+                })
+            },
             concrete::FieldAccessExpr::Index { array, index, span } => {
                 Ok(Expr::Index {
                     expr: Box::new(array.into_hir(scope)?),
@@ -1724,6 +1748,15 @@ impl Literal {
                 }
                 // nil relies entirely on the expected type
                 if let Some(expected_ty) = expected {
+                    match expected_ty {
+                        Type::Optional { .. } => {},
+                        _ => {
+                            return Err(CompileError::Error(
+                                *span,
+                                format!("type mismatch: expected '{}', found 'nil'", expected_ty),
+                            ))
+                        },
+                    }
                     ty.reconcile_type(&mut MaybeType::Resolved(expected_ty), *span)?;
                 }
                 Ok(!ty.is_inferred())
@@ -2213,6 +2246,10 @@ impl Expr {
                             // now, we need to perform a series of field accesses to get the final
                             // type
                             for f in &field[1..] {
+                                current_ty = match current_ty {
+                                    Type::Ref { ty, .. } => ty,
+                                    _ => current_ty,
+                                };
                                 match current_ty {
                                     Type::Struct { fields, .. } => {
                                         match fields {
@@ -2377,6 +2414,58 @@ impl Expr {
                     ty.reconcile_type(&mut MaybeType::Resolved(expected_ty), *span)?;
                 }
             },
+            Expr::Unwrap { expr, ty, span } => {
+                if let Some(expected_ty) = expected {
+                    ty.reconcile_type(&mut MaybeType::Resolved(expected_ty), *span)?;
+                }
+                inferred |= expr.infer(scope, None)?;
+                if let MaybeType::Resolved(expr_ty) = expr.ty() {
+                    match expr_ty {
+                        Type::Optional { ty: inner_ty, .. } => {
+                            ty.reconcile_type(&mut MaybeType::Resolved(inner_ty), *span)?;
+                        },
+                        _ => {
+                            return Err(CompileError::Error(
+                                *span,
+                                format!("type '{}' is not an optional type", expr_ty),
+                            ));
+                        },
+                    }
+                }
+            },
+            Expr::Wrap { expr, ty, span } => {
+                if let Some(expected_ty) = expected {
+                    match expected_ty {
+                        Type::Optional { ty: inner_ty, .. } => {
+                            ty.reconcile_type(&mut MaybeType::Resolved(expected_ty), *span)?;
+                        },
+                        _ => {
+                            return Err(CompileError::Error(
+                                *span,
+                                format!("type '{}' is not an optional type", expected_ty),
+                            ));
+                        },
+                    }
+                }
+                let expected_inner_ty = if let MaybeType::Resolved(expected_ty) = ty {
+                    match expected_ty {
+                        Type::Optional { ty: inner_ty, .. } => Some(*inner_ty),
+                        _ => None,
+                    }
+                } else {
+                    None
+                };
+                inferred |= expr.infer(scope, expected_inner_ty)?;
+                if let MaybeType::Resolved(expr_ty) = expr.ty() {
+                    let optional_ty = Type::Optional {
+                        id: 0,
+                        ty: expr_ty,
+                        scope,
+                    }
+                    .store();
+                    ty.reconcile_type(&mut MaybeType::Resolved(optional_ty), *span)?;
+                }
+            },
             Expr::FieldAccess {
                 expr,
                 field,
@@ -2386,6 +2475,10 @@ impl Expr {
                 inferred |= expr.infer(scope, None)?;
                 // now, we need to see if we can infer the field's type based on the expr's type
                 if let MaybeType::Resolved(expr_ty) = expr.ty_mut() {
+                    let expr_ty = match expr_ty {
+                        Type::Ref { ty, .. } => ty,
+                        _ => expr_ty,
+                    };
                     match expr_ty {
                         Type::Struct { fields, .. } => {
                             match fields {
@@ -2670,6 +2763,25 @@ impl Expr {
                     ));
                 }
             },
+            Expr::Unwrap { expr, ty, span, .. } => {
+                expr.check_fully_resolved()?;
+                if !ty.is_resolved() {
+                    return Err(CompileError::Error(
+                        *span,
+                        "the type of this postfix operation could not be fully resolved"
+                            .to_string(),
+                    ));
+                }
+            },
+            Expr::Wrap { expr, ty, span, .. } => {
+                expr.check_fully_resolved()?;
+                if !ty.is_resolved() {
+                    return Err(CompileError::Error(
+                        *span,
+                        "the type of this wrap operation could not be fully resolved".to_string(),
+                    ));
+                }
+            },
             Expr::FieldAccess { expr, ty, span, .. } => {
                 expr.check_fully_resolved()?;
                 if !ty.is_resolved() {
@@ -2755,6 +2867,8 @@ impl Expr {
             Expr::Range { ty, .. } => ty,
             Expr::BinaryOp { ty, .. } => ty,
             Expr::UnaryOp { ty, .. } => ty,
+            Expr::Unwrap { ty, .. } => ty,
+            Expr::Wrap { ty, .. } => ty,
             Expr::Literal(lit) => lit.ty(),
             Expr::Path { ty, .. } => ty,
             Expr::Tuple { ty, .. } => ty,
@@ -2792,6 +2906,8 @@ impl Expr {
             Expr::Range { span, .. } => *span,
             Expr::BinaryOp { span, .. } => *span,
             Expr::UnaryOp { span, .. } => *span,
+            Expr::Unwrap { span, .. } => *span,
+            Expr::Wrap { span, .. } => *span,
             Expr::Literal(lit) => lit.span(),
             Expr::Path { span, .. } => *span,
             Expr::Tuple { span, .. } => *span,
@@ -2969,7 +3085,7 @@ impl Expr {
             },
             Expr::UnaryOp { expr, op, ty, .. } => {
                 if let UnaryOp::Ref = op {
-                    if ty.ty().is_copy_type() {
+                    if expr.ty().ty().is_copy_type() {
                         return Err(CompileError::Error(
                             expr.span(),
                             "cannot take a reference to a copy type".to_string(),
@@ -2995,6 +3111,14 @@ impl Expr {
                     moveset.new_value();
                 }
             },
+            Expr::Unwrap { expr, .. } => {
+                moveset.new_value();
+                moveset = expr.check_ownership(moveset, moving)?;
+            },
+            Expr::Wrap { expr, .. } => {
+                moveset.new_value();
+                moveset = expr.check_ownership(moveset, moving)?;
+            },
             Expr::Call { func, args, .. } => {
                 moveset.new_value();
                 moveset = func.check_ownership(moveset, false)?;
@@ -3012,6 +3136,11 @@ impl Expr {
                 ..
             } => {
                 moveset.new_value();
+                let expr = if let Expr::Unwrap { expr, .. } = expr.as_mut() {
+                    expr
+                } else {
+                    expr
+                };
                 if let Expr::Value { .. } = expr.as_ref() {
                     moveset = expr.check_ownership(moveset, false)?;
                     #[allow(clippy::mutable_key_type)]
@@ -3088,6 +3217,8 @@ impl Expr {
             Expr::Range { .. } => true,
             Expr::BinaryOp { .. } => true,
             Expr::UnaryOp { .. } => true,
+            Expr::Unwrap { .. } => true,
+            Expr::Wrap { .. } => true,
             Expr::FieldAccess { .. } => false,
             Expr::MethodCall { .. } => true,
             Expr::Call { .. } => true,

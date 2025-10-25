@@ -206,6 +206,14 @@ pub enum Expr {
         expr: Box<Expr>,
         ty:   &'static IrType,
     },
+    Unwrap {
+        expr: Box<Expr>,
+        ty:   &'static IrType,
+    },
+    Wrap {
+        expr: Box<Expr>,
+        ty:   &'static IrType,
+    },
     Call {
         func: Box<Expr>,
         args: Vec<Expr>,
@@ -904,6 +912,18 @@ impl hir::Expr {
                     ty:   ty.ty().into_ir(),
                 }
             },
+            hir::Expr::Unwrap { expr, ty, .. } => {
+                Expr::Unwrap {
+                    expr: Box::new(expr.into_ir(labels)),
+                    ty:   ty.ty().into_ir(),
+                }
+            },
+            hir::Expr::Wrap { expr, ty, .. } => {
+                Expr::Wrap {
+                    expr: Box::new(expr.into_ir(labels)),
+                    ty:   ty.ty().into_ir(),
+                }
+            },
             hir::Expr::Call { func, args, ty, .. } => {
                 Expr::Call {
                     func: Box::new(func.into_ir(labels)),
@@ -1083,6 +1103,8 @@ impl Expr {
             Expr::Assign { .. } => &IrType::Unit,
             Expr::BinaryOp { ty, .. } => ty,
             Expr::UnaryOp { ty, .. } => ty,
+            Expr::Unwrap { ty, .. } => ty,
+            Expr::Wrap { ty, .. } => ty,
             Expr::Call { ty, .. } => ty,
             Expr::FieldAccess { ty, .. } => ty,
             Expr::Index { ty, .. } => ty,

@@ -386,6 +386,7 @@ pub enum Value {
         name:       token::Ident,
         ret_ty:     MaybeType,
         params:     Vec<(token::Ident, MaybeType, Option<&'static Value>)>,
+        scope:      &'static Scope,
         body:       Box<hir::Block>,
         ty:         MaybeType,
     },
@@ -484,7 +485,7 @@ impl Value {
 }
 
 pub const PRINT_I32_VALUE_ID: u64 = 1;
-pub const FIRST_NON_RESERVED_VALUE_ID: u64 = 2;
+pub const FIRST_NON_RESERVED_VALUE_ID: u64 = 5;
 
 impl InitStore for Value {
     fn init_store(store: &mut Store<Value>) {
@@ -1743,6 +1744,7 @@ impl Value {
                 params,
                 ty,
                 body,
+                scope,
                 ..
             } => {
                 let ret_ty_span = match ret_ty {
@@ -1753,7 +1755,7 @@ impl Value {
                 body.scope.set_return_ty(ret_ty.ty());
                 for (name, ty, value) in params.iter_mut() {
                     ty.resolve_explicit()?;
-                    *value = Some(body.scope.new_value(name.clone(), Value::Var {
+                    *value = Some(scope.new_value(name.clone(), Value::Var {
                         id:              0,
                         name:            name.clone(),
                         ty:              ty.clone(),

@@ -2012,7 +2012,21 @@ impl Parse for FieldAccessExpr {
         };
         let mut expr = FieldAccessExpr::Primary(Box::new(PrimaryExpr::parse(cursor)?));
         loop {
-            if cursor.consume_symbol(Symbol::OpenBracket).is_ok() {
+            if cursor.consume_symbol(Symbol::Bang).is_ok() {
+                // postfix unwrap
+                let span = span.join(cursor.prev_span());
+                expr = FieldAccessExpr::Unwrap {
+                    expr: Box::new(expr),
+                    span,
+                };
+            } else if cursor.consume_symbol(Symbol::Question).is_ok() {
+                // postfix optional unwrap
+                let span = span.join(cursor.prev_span());
+                expr = FieldAccessExpr::Wrap {
+                    expr: Box::new(expr),
+                    span,
+                };
+            } else if cursor.consume_symbol(Symbol::OpenBracket).is_ok() {
                 // indexing
                 let index = Expr::parse(cursor)?;
                 cursor.consume_symbol(Symbol::CloseBracket)?;
@@ -2097,6 +2111,12 @@ impl Parse for FieldAccessExpr {
 
     fn unparse(&self) -> String {
         match self {
+            FieldAccessExpr::Unwrap { expr, .. } => {
+                format!("{}!", expr.unparse())
+            },
+            FieldAccessExpr::Wrap { expr, .. } => {
+                format!("{}?", expr.unparse())
+            },
             FieldAccessExpr::Index { array, index, .. } => {
                 format!("{}[{}]", array.unparse(), index.unparse())
             },

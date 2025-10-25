@@ -1,3 +1,4 @@
+#![allow(clippy::vec_init_then_push)]
 use crate::{prelude::*, reprs::ir::*};
 
 #[derive(Debug)]
@@ -6,6 +7,7 @@ pub enum Instr {
     Comment(&'static str),
     Nop,
     Drop,
+    Unreachable,
     I32Const(i32),
     I32Add,
     I32Sub,
@@ -50,6 +52,7 @@ pub enum Instr {
 
     Alloc(u32),
     Dealloc,
+    TypeEq(&'static IrType),
     // call the destructor for the given type, one argument is the pointer to the value
     Destruct(&'static IrType),
     I32Load,
@@ -77,6 +80,7 @@ impl Instr {
             Instr::Comment(msg) => format!(";; {}", msg),
             Instr::Nop => "nop".to_string(),
             Instr::Drop => "drop".to_string(),
+            Instr::Unreachable => "unreachable".to_string(),
             Instr::I32Const(val) => format!("i32.const {}", val),
             Instr::I32Add => "i32.add".to_string(),
             Instr::I32Sub => "i32.sub".to_string(),
@@ -148,6 +152,9 @@ impl Instr {
             },
             Instr::Destruct(ty) => {
                 format!("call $destruct{}", ty.id())
+            },
+            Instr::TypeEq(ty) => {
+                format!("call $eq{}", ty.id())
             },
         }
     }
@@ -264,11 +271,107 @@ impl IrType {
                         .as_str(),
                 );
                 wat.push_str(")\n");
+                wat.push_str(&format!(
+                    "(func $eq{} (param $var1 i32) (param $var2 i32) (result i32)\n",
+                    id
+                ));
+                #[allow(clippy::vec_init_then_push)]
+                let mut instrs = Vec::new();
+                // check if they're the same pointer
+                instrs.push(Instr::LocalGet(1)); // var1
+                instrs.push(Instr::LocalGet(2)); // var2
+                instrs.push(Instr::I32Eq);
+                instrs.push(Instr::If(&IrType::Unit));
+                instrs.push(Instr::I32Const(1));
+                instrs.push(Instr::Return);
+                instrs.push(Instr::End);
+                match fields {
+                    StructFields::Named { fields } => {
+                        let mut offset = 0;
+                        for field in fields {
+                            if !field.ty.is_valued() {
+                                offset += Wasm32Backend::type_size(field.ty);
+                                continue;
+                            }
+                            instrs.push(Instr::LocalGet(1)); // var1
+                            instrs.push(Instr::I32Const(offset as i32));
+                            instrs.push(Instr::I32Add);
+                            instrs.push(field.ty.wasm_load());
+                            instrs.push(Instr::LocalGet(2)); // var2
+                            instrs.push(Instr::I32Const(offset as i32));
+                            instrs.push(Instr::I32Add);
+                            instrs.push(field.ty.wasm_load());
+                            match field.ty {
+                                IrType::F64 => {
+                                    instrs.push(Instr::F64Eq);
+                                },
+                                IrType::I32 | IrType::Bool | IrType::Fn { .. } => {
+                                    instrs.push(Instr::I32Eq);
+                                },
+                                IrType::Temp { .. } | IrType::Never | IrType::Unit => {
+                                    panic!(
+                                        "Cannot compare field of type {:?} for equality",
+                                        field.ty
+                                    );
+                                },
+                                IrType::Ref { ty, .. } => {
+                                    instrs.push(Instr::TypeEq(ty));
+                                },
+                                IrType::Struct { .. }
+                                | IrType::Tuple { .. }
+                                | IrType::Array { .. } => {
+                                    instrs.push(Instr::TypeEq(field.ty));
+                                },
+                                IrType::Optional { ty, .. } => {
+                                    match ty {
+                                        IrType::F64 => {
+                                            instrs.push(Instr::F64Eq);
+                                        },
+                                        IrType::I32 | IrType::Bool | IrType::Fn { .. } => {
+                                            instrs.push(Instr::I32Eq);
+                                        },
+                                        IrType::Temp { .. } | IrType::Never | IrType::Unit => {
+                                            panic!(
+                                                "Cannot compare field of type {:?} for equality",
+                                                ty
+                                            );
+                                        },
+                                        IrType::Ref { ty, .. } => {
+                                            instrs.push(Instr::TypeEq(ty));
+                                        },
+                                        IrType::Struct { .. }
+                                        | IrType::Tuple { .. }
+                                        | IrType::Array { .. } => {
+                                            instrs.push(Instr::TypeEq(ty));
+                                        },
+                                        IrType::Optional { .. } => {
+                                            unimplemented!("Nested optionals not supported");
+                                        },
+                                    }
+                                },
+                            }
+                            instrs.push(Instr::If(&IrType::Unit));
+                            instrs.push(Instr::Else);
+                            instrs.push(Instr::I32Const(0));
+                            instrs.push(Instr::Return);
+                            instrs.push(Instr::End);
+                            offset += Wasm32Backend::type_size(field.ty);
+                        }
+                    },
+                }
+                wat.push_str(
+                    instrs
+                        .iter()
+                        .map(|x| format!("  {}\n", x.to_wat()))
+                        .collect::<String>()
+                        .as_str(),
+                );
+                wat.push_str("(i32.const 1))\n");
             },
             IrType::Tuple { id, fields } => {
                 // destructor function
                 wat.push_str(&format!(
-                    "(func $destruct{} (param $var{TMP_VAR_ID} i32) i32)\n",
+                    "(func $destruct{} (param $var{TMP_VAR_ID} i32)\n",
                     id
                 ));
                 let mut instrs = Vec::new();
@@ -293,11 +396,94 @@ impl IrType {
                         .as_str(),
                 );
                 wat.push_str(")\n");
+                wat.push_str(&format!(
+                    "(func $eq{} (param $var1 i32) (param $var2 i32) (result i32)\n",
+                    id
+                ));
+                let mut instrs = Vec::new();
+                // check if they're the same pointer
+                instrs.push(Instr::LocalGet(1)); // var1
+                instrs.push(Instr::LocalGet(2)); // var2
+                instrs.push(Instr::I32Eq);
+                instrs.push(Instr::If(&IrType::Unit));
+                instrs.push(Instr::I32Const(1));
+                instrs.push(Instr::Return);
+                instrs.push(Instr::End);
+                let mut offset = 0;
+                for field in fields {
+                    if !field.is_valued() {
+                        offset += Wasm32Backend::type_size(field);
+                        continue;
+                    }
+                    instrs.push(Instr::LocalGet(1)); // var1
+                    instrs.push(Instr::I32Const(offset as i32));
+                    instrs.push(Instr::I32Add);
+                    instrs.push(field.wasm_load());
+                    instrs.push(Instr::LocalGet(2)); // var2
+                    instrs.push(Instr::I32Const(offset as i32));
+                    instrs.push(Instr::I32Add);
+                    instrs.push(field.wasm_load());
+                    match field {
+                        IrType::F64 => {
+                            instrs.push(Instr::F64Eq);
+                        },
+                        IrType::I32 | IrType::Bool | IrType::Fn { .. } => {
+                            instrs.push(Instr::I32Eq);
+                        },
+                        IrType::Temp { .. } | IrType::Never | IrType::Unit => {
+                            panic!("Cannot compare field of type {:?} for equality", field);
+                        },
+                        IrType::Ref { ty, .. } => {
+                            instrs.push(Instr::TypeEq(ty));
+                        },
+                        IrType::Struct { .. } | IrType::Tuple { .. } | IrType::Array { .. } => {
+                            instrs.push(Instr::TypeEq(field));
+                        },
+                        IrType::Optional { ty, .. } => {
+                            match ty {
+                                IrType::F64 => {
+                                    instrs.push(Instr::F64Eq);
+                                },
+                                IrType::I32 | IrType::Bool | IrType::Fn { .. } => {
+                                    instrs.push(Instr::I32Eq);
+                                },
+                                IrType::Temp { .. } | IrType::Never | IrType::Unit => {
+                                    panic!("Cannot compare field of type {:?} for equality", ty);
+                                },
+                                IrType::Ref { ty, .. } => {
+                                    instrs.push(Instr::TypeEq(ty));
+                                },
+                                IrType::Struct { .. }
+                                | IrType::Tuple { .. }
+                                | IrType::Array { .. } => {
+                                    instrs.push(Instr::TypeEq(ty));
+                                },
+                                IrType::Optional { .. } => {
+                                    unimplemented!("Nested optionals not supported");
+                                },
+                            }
+                        },
+                    }
+                    instrs.push(Instr::If(&IrType::Unit));
+                    instrs.push(Instr::Else);
+                    instrs.push(Instr::I32Const(0));
+                    instrs.push(Instr::Return);
+                    instrs.push(Instr::End);
+                    offset += Wasm32Backend::type_size(field);
+                }
+                wat.push_str(
+                    instrs
+                        .iter()
+                        .map(|x| format!("  {}\n", x.to_wat()))
+                        .collect::<String>()
+                        .as_str(),
+                );
+                wat.push_str("(i32.const 1))\n");
             },
             IrType::Array { id, ty, length, .. } => {
                 // destructor function
                 wat.push_str(&format!(
-                    "(func $destruct{} (param $var{TMP_VAR_ID} i32) i32)\n",
+                    "(func $destruct{} (param $var{TMP_VAR_ID} i32)\n",
                     id
                 ));
                 let mut instrs = Vec::new();
@@ -314,6 +500,89 @@ impl IrType {
                 instrs.push(Instr::LocalGet(TMP_VAR_ID));
                 instrs.push(Instr::Dealloc);
                 wat.push_str(")\n");
+                wat.push_str(&format!(
+                    "(func $eq{} (param $var1 i32) (param $var2 i32) (result i32)\n",
+                    id
+                ));
+                let mut instrs = Vec::new();
+                // check if they're the same pointer
+                instrs.push(Instr::LocalGet(1)); // var1
+                instrs.push(Instr::LocalGet(2)); // var2
+                instrs.push(Instr::I32Eq);
+                instrs.push(Instr::If(&IrType::Unit));
+                instrs.push(Instr::I32Const(1));
+                instrs.push(Instr::Return);
+                instrs.push(Instr::End);
+                let mut offset = 0;
+                for _ in 0..*length {
+                    if !ty.is_valued() {
+                        offset += Wasm32Backend::type_size(ty);
+                        continue;
+                    }
+                    instrs.push(Instr::LocalGet(1)); // var1
+                    instrs.push(Instr::I32Const(offset as i32));
+                    instrs.push(Instr::I32Add);
+                    instrs.push(ty.wasm_load());
+                    instrs.push(Instr::LocalGet(2)); // var2
+                    instrs.push(Instr::I32Const(offset as i32));
+                    instrs.push(Instr::I32Add);
+                    instrs.push(ty.wasm_load());
+                    match ty {
+                        IrType::F64 => {
+                            instrs.push(Instr::F64Eq);
+                        },
+                        IrType::I32 | IrType::Bool | IrType::Fn { .. } => {
+                            instrs.push(Instr::I32Eq);
+                        },
+                        IrType::Temp { .. } | IrType::Never | IrType::Unit => {
+                            panic!("Cannot compare field of type {:?} for equality", ty);
+                        },
+                        IrType::Ref { ty, .. } => {
+                            instrs.push(Instr::TypeEq(ty));
+                        },
+                        IrType::Struct { .. } | IrType::Tuple { .. } | IrType::Array { .. } => {
+                            instrs.push(Instr::TypeEq(ty));
+                        },
+                        IrType::Optional { ty, .. } => {
+                            match ty {
+                                IrType::F64 => {
+                                    instrs.push(Instr::F64Eq);
+                                },
+                                IrType::I32 | IrType::Bool | IrType::Fn { .. } => {
+                                    instrs.push(Instr::I32Eq);
+                                },
+                                IrType::Temp { .. } | IrType::Never | IrType::Unit => {
+                                    panic!("Cannot compare field of type {:?} for equality", ty);
+                                },
+                                IrType::Ref { ty, .. } => {
+                                    instrs.push(Instr::TypeEq(ty));
+                                },
+                                IrType::Struct { .. }
+                                | IrType::Tuple { .. }
+                                | IrType::Array { .. } => {
+                                    instrs.push(Instr::TypeEq(ty));
+                                },
+                                IrType::Optional { .. } => {
+                                    unimplemented!("Nested optionals not supported");
+                                },
+                            }
+                        },
+                    }
+                    instrs.push(Instr::If(&IrType::Unit));
+                    instrs.push(Instr::Else);
+                    instrs.push(Instr::I32Const(0));
+                    instrs.push(Instr::Return);
+                    instrs.push(Instr::End);
+                    offset += Wasm32Backend::type_size(ty);
+                }
+                wat.push_str(
+                    instrs
+                        .iter()
+                        .map(|x| format!("  {}\n", x.to_wat()))
+                        .collect::<String>()
+                        .as_str(),
+                );
+                wat.push_str("(i32.const 1))\n");
             },
             IrType::Optional { id, ty, .. } => {
                 if ty.wasm_is_allocated() {
@@ -348,6 +617,84 @@ impl IrType {
                     instrs.push(Instr::LocalGet(TMP_VAR_ID));
                     instrs.push(Instr::Destruct(ty));
                     instrs.push(Instr::End);
+                    wat.push_str(
+                        instrs
+                            .iter()
+                            .map(|x| format!("  {}\n", x.to_wat()))
+                            .collect::<String>()
+                            .as_str(),
+                    );
+                    wat.push_str(")\n");
+                    wat.push_str(&format!(
+                        "(func $eq{} (param $var1 i32) (param $var2 i32) (result i32)\n",
+                        id
+                    ));
+                    let mut instrs = Vec::new();
+                    // check if they're the same pointer
+                    instrs.push(Instr::LocalGet(1)); // var1
+                    instrs.push(Instr::LocalGet(2)); // var2
+                    instrs.push(Instr::I32Eq);
+                    instrs.push(Instr::If(&IrType::Unit));
+                    instrs.push(Instr::I32Const(1));
+                    instrs.push(Instr::Return);
+                    instrs.push(Instr::End);
+                    // if either is nil, return false
+                    instrs.push(Instr::LocalGet(1)); // var1
+                    instrs.extend(Expr::Literal(Literal::Nil { ty }).compile_wasm());
+                    match ty {
+                        IrType::F64 => {
+                            unimplemented!("WASM code generation for optional f64 not implemented");
+                        },
+                        IrType::Temp { .. } | IrType::Never | IrType::Unit => {
+                            panic!("Cannot compare optional of type {:?} for equality", ty);
+                        },
+                        IrType::Optional { .. } => {
+                            unimplemented!("Nested optionals not supported");
+                        },
+                        IrType::I32
+                        | IrType::Bool
+                        | IrType::Struct { .. }
+                        | IrType::Tuple { .. }
+                        | IrType::Array { .. }
+                        | IrType::Ref { .. }
+                        | IrType::Fn { .. } => {
+                            instrs.push(Instr::I32Eq);
+                        },
+                    }
+                    instrs.push(Instr::If(&IrType::Unit));
+                    instrs.push(Instr::I32Const(0));
+                    instrs.push(Instr::Return);
+                    instrs.push(Instr::End);
+                    instrs.push(Instr::LocalGet(2)); // var2
+                    instrs.extend(Expr::Literal(Literal::Nil { ty }).compile_wasm());
+                    match ty {
+                        IrType::F64 => {
+                            unimplemented!("WASM code generation for optional f64 not implemented");
+                        },
+                        IrType::Temp { .. } | IrType::Never | IrType::Unit => {
+                            panic!("Cannot compare optional of type {:?} for equality", ty);
+                        },
+                        IrType::Optional { .. } => {
+                            unimplemented!("Nested optionals not supported");
+                        },
+                        IrType::I32
+                        | IrType::Bool
+                        | IrType::Struct { .. }
+                        | IrType::Tuple { .. }
+                        | IrType::Array { .. }
+                        | IrType::Ref { .. }
+                        | IrType::Fn { .. } => {
+                            instrs.push(Instr::I32Eq);
+                        },
+                    }
+                    instrs.push(Instr::If(&IrType::Unit));
+                    instrs.push(Instr::I32Const(0));
+                    instrs.push(Instr::Return);
+                    instrs.push(Instr::End);
+                    // compare the inner values
+                    instrs.push(Instr::LocalGet(1)); // var1
+                    instrs.push(Instr::LocalGet(2)); // var2
+                    instrs.push(Instr::TypeEq(ty));
                     wat.push_str(
                         instrs
                             .iter()
@@ -478,6 +825,7 @@ impl Wasm32Backend {
                     },
                 }
             },
+            IrType::Ref { ty, .. } => Self::field_offset(ty, field_name),
             _ => panic!("Expected struct type"),
         }
     }
@@ -769,14 +1117,11 @@ impl Expr {
                 }
             },
             Expr::BinaryOp {
-                left,
-                op,
-                right,
-                ty,
+                left, op, right, ..
             } => {
                 instrs.extend(left.compile_wasm());
                 instrs.extend(right.compile_wasm());
-                match (op, ty) {
+                match (op, left.ty()) {
                     (BinaryOp::Add, IrType::I32) => instrs.push(Instr::I32Add),
                     (BinaryOp::Sub, IrType::I32) => instrs.push(Instr::I32Sub),
                     (BinaryOp::Mul, IrType::I32) => instrs.push(Instr::I32Mul),
@@ -790,14 +1135,6 @@ impl Expr {
 
                     (BinaryOp::And, IrType::Bool) => instrs.push(Instr::I32And),
                     (BinaryOp::Or, IrType::Bool) => instrs.push(Instr::I32Or),
-
-                    // TODO: extend this for other types
-                    (BinaryOp::Eq, IrType::I32) => instrs.push(Instr::I32Eq),
-                    (BinaryOp::Neq, IrType::I32) => instrs.push(Instr::I32Ne),
-                    (BinaryOp::Eq, IrType::F64) => instrs.push(Instr::F64Eq),
-                    (BinaryOp::Neq, IrType::F64) => instrs.push(Instr::F64Ne),
-                    (BinaryOp::Eq, IrType::Bool) => instrs.push(Instr::I32Eq),
-                    (BinaryOp::Neq, IrType::Bool) => instrs.push(Instr::I32Ne),
 
                     (BinaryOp::Lt, IrType::I32) => instrs.push(Instr::I32LtS),
                     (BinaryOp::Leq, IrType::I32) => instrs.push(Instr::I32LeS),
@@ -813,6 +1150,52 @@ impl Expr {
                     (BinaryOp::BitXor, IrType::I32) => instrs.push(Instr::I32Xor),
                     (BinaryOp::Shl, IrType::I32) => instrs.push(Instr::I32Shl),
                     (BinaryOp::Shr, IrType::I32) => instrs.push(Instr::I32ShrS),
+                    (BinaryOp::Eq, t) => {
+                        match t {
+                            IrType::I32 | IrType::Bool | IrType::Fn { .. } => {
+                                instrs.push(Instr::I32Eq);
+                            },
+                            IrType::F64 => {
+                                instrs.push(Instr::F64Eq);
+                            },
+                            IrType::Temp { .. } | IrType::Never | IrType::Unit => {
+                                panic!("Cannot compare values of type {:?} for equality", t);
+                            },
+                            IrType::Ref { ty, .. } => {
+                                instrs.push(Instr::TypeEq(ty));
+                            },
+                            IrType::Struct { .. }
+                            | IrType::Tuple { .. }
+                            | IrType::Array { .. }
+                            | IrType::Optional { .. } => {
+                                instrs.push(Instr::TypeEq(t));
+                            },
+                        }
+                    },
+                    (BinaryOp::Neq, t) => {
+                        match t {
+                            IrType::I32 | IrType::Bool | IrType::Fn { .. } => {
+                                instrs.push(Instr::I32Ne);
+                            },
+                            IrType::F64 => {
+                                instrs.push(Instr::F64Ne);
+                            },
+                            IrType::Temp { .. } | IrType::Never | IrType::Unit => {
+                                panic!("Cannot compare values of type {:?} for inequality", t);
+                            },
+                            IrType::Ref { ty, .. } => {
+                                instrs.push(Instr::TypeEq(ty));
+                                instrs.push(Instr::I32Eqz);
+                            },
+                            IrType::Struct { .. }
+                            | IrType::Tuple { .. }
+                            | IrType::Array { .. }
+                            | IrType::Optional { .. } => {
+                                instrs.push(Instr::TypeEq(t));
+                                instrs.push(Instr::I32Eqz);
+                            },
+                        }
+                    },
 
                     _ => {
                         unimplemented!(
@@ -824,7 +1207,7 @@ impl Expr {
                 }
             },
             Expr::UnaryOp { op, expr, ty } => {
-                match (op, ty) {
+                match (op, expr.ty()) {
                     (UnaryOp::Neg, IrType::I32) => {
                         instrs.push(Instr::I32Const(0));
                         instrs.extend(expr.compile_wasm());
@@ -858,6 +1241,38 @@ impl Expr {
                         );
                     },
                 }
+            },
+            Expr::Unwrap { expr, ty } => {
+                instrs.extend(expr.compile_wasm());
+                match ty {
+                    IrType::F64 => {
+                        unimplemented!("WASM code generation for optional f64 not implemented");
+                    },
+                    IrType::Temp { .. } | IrType::Never | IrType::Unit => {
+                        panic!("Cannot unwrap optional of type {:?}", ty);
+                    },
+                    IrType::I32
+                    | IrType::Bool
+                    | IrType::Struct { .. }
+                    | IrType::Tuple { .. }
+                    | IrType::Array { .. }
+                    | IrType::Ref { .. }
+                    | IrType::Fn { .. } => {
+                        instrs.push(Instr::LocalTee(TMP_VAR_ID));
+                        instrs.push(Instr::LocalGet(TMP_VAR_ID));
+                        instrs.extend(Expr::Literal(Literal::Nil { ty }).compile_wasm());
+                        instrs.push(Instr::I32Eq);
+                    },
+                    IrType::Optional { .. } => {
+                        unimplemented!("Nested optionals not supported");
+                    },
+                }
+                instrs.push(Instr::If(&IrType::Unit));
+                instrs.push(Instr::Unreachable);
+                instrs.push(Instr::End);
+            },
+            Expr::Wrap { expr, .. } => {
+                instrs.extend(expr.compile_wasm());
             },
             Expr::Call { func, args, .. } => {
                 for arg in args {
