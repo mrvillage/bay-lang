@@ -2563,6 +2563,8 @@ impl Expr {
                         }
                         for (arg, param_ty) in args.iter_mut().zip(param_tys.iter()) {
                             inferred |= arg.infer(scope, Some(*param_ty))?;
+                            let span = arg.span();
+                            MaybeType::Resolved(param_ty).reconcile_type(arg.ty_mut(), span)?;
                         }
                         ty.reconcile_type(&mut MaybeType::Resolved(ret_ty), *span)?;
                         if let Some(expected_ty) = expected {

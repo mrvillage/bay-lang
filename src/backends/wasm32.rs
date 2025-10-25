@@ -591,11 +591,9 @@ impl IrType {
                         id, TMP_VAR_ID
                     ));
                     let mut instrs = Vec::new();
-                    instrs.push(Instr::LocalGet(TMP_VAR_ID));
-                    instrs.extend(Expr::Literal(Literal::Nil { ty }).compile_wasm());
                     match ty {
                         IrType::F64 => {
-                            unimplemented!("WASM code generation for optional f64 not implemented");
+                            panic!("f64s are not allocated");
                         },
                         IrType::Temp { .. } | IrType::Never | IrType::Unit => {
                             panic!("Cannot destruct optional of type {:?}", ty);
@@ -610,6 +608,8 @@ impl IrType {
                         | IrType::Array { .. }
                         | IrType::Ref { .. }
                         | IrType::Fn { .. } => {
+                            instrs.push(Instr::LocalGet(TMP_VAR_ID));
+                            instrs.extend(Expr::Literal(Literal::Nil { ty }).compile_wasm());
                             instrs.push(Instr::I32Ne);
                         },
                     }
@@ -643,7 +643,7 @@ impl IrType {
                     instrs.extend(Expr::Literal(Literal::Nil { ty }).compile_wasm());
                     match ty {
                         IrType::F64 => {
-                            unimplemented!("WASM code generation for optional f64 not implemented");
+                            instrs.push(Instr::F64Eq);
                         },
                         IrType::Temp { .. } | IrType::Never | IrType::Unit => {
                             panic!("Cannot compare optional of type {:?} for equality", ty);
@@ -669,7 +669,7 @@ impl IrType {
                     instrs.extend(Expr::Literal(Literal::Nil { ty }).compile_wasm());
                     match ty {
                         IrType::F64 => {
-                            unimplemented!("WASM code generation for optional f64 not implemented");
+                            instrs.push(Instr::F64Eq);
                         },
                         IrType::Temp { .. } | IrType::Never | IrType::Unit => {
                             panic!("Cannot compare optional of type {:?} for equality", ty);
@@ -1150,8 +1150,8 @@ impl Expr {
                     (BinaryOp::BitXor, IrType::I32) => instrs.push(Instr::I32Xor),
                     (BinaryOp::Shl, IrType::I32) => instrs.push(Instr::I32Shl),
                     (BinaryOp::Shr, IrType::I32) => instrs.push(Instr::I32ShrS),
-                    (BinaryOp::Eq, t) => {
-                        match t {
+                    (BinaryOp::Eq, ty) => {
+                        match ty {
                             IrType::I32 | IrType::Bool | IrType::Fn { .. } => {
                                 instrs.push(Instr::I32Eq);
                             },
@@ -1159,21 +1159,45 @@ impl Expr {
                                 instrs.push(Instr::F64Eq);
                             },
                             IrType::Temp { .. } | IrType::Never | IrType::Unit => {
-                                panic!("Cannot compare values of type {:?} for equality", t);
+                                panic!("Cannot compare values of type {:?} for equality", ty);
                             },
                             IrType::Ref { ty, .. } => {
                                 instrs.push(Instr::TypeEq(ty));
                             },
-                            IrType::Struct { .. }
-                            | IrType::Tuple { .. }
-                            | IrType::Array { .. }
-                            | IrType::Optional { .. } => {
-                                instrs.push(Instr::TypeEq(t));
+                            IrType::Optional { ty: inner_ty, .. } => {
+                                match inner_ty {
+                                    IrType::F64 => {
+                                        instrs.push(Instr::F64Eq);
+                                    },
+                                    IrType::I32 | IrType::Bool | IrType::Fn { .. } => {
+                                        instrs.push(Instr::I32Eq);
+                                    },
+                                    IrType::Temp { .. } | IrType::Never | IrType::Unit => {
+                                        panic!(
+                                            "Cannot compare values of type {:?} for equality",
+                                            ty
+                                        );
+                                    },
+                                    IrType::Ref { ty, .. } => {
+                                        instrs.push(Instr::TypeEq(ty));
+                                    },
+                                    IrType::Struct { .. }
+                                    | IrType::Tuple { .. }
+                                    | IrType::Array { .. } => {
+                                        instrs.push(Instr::TypeEq(ty));
+                                    },
+                                    IrType::Optional { .. } => {
+                                        unimplemented!("Nested optionals not supported");
+                                    },
+                                }
+                            },
+                            IrType::Struct { .. } | IrType::Tuple { .. } | IrType::Array { .. } => {
+                                instrs.push(Instr::TypeEq(ty));
                             },
                         }
                     },
-                    (BinaryOp::Neq, t) => {
-                        match t {
+                    (BinaryOp::Neq, ty) => {
+                        match ty {
                             IrType::I32 | IrType::Bool | IrType::Fn { .. } => {
                                 instrs.push(Instr::I32Ne);
                             },
@@ -1181,17 +1205,43 @@ impl Expr {
                                 instrs.push(Instr::F64Ne);
                             },
                             IrType::Temp { .. } | IrType::Never | IrType::Unit => {
-                                panic!("Cannot compare values of type {:?} for inequality", t);
+                                panic!("Cannot compare values of type {:?} for inequality", ty);
                             },
                             IrType::Ref { ty, .. } => {
                                 instrs.push(Instr::TypeEq(ty));
                                 instrs.push(Instr::I32Eqz);
                             },
-                            IrType::Struct { .. }
-                            | IrType::Tuple { .. }
-                            | IrType::Array { .. }
-                            | IrType::Optional { .. } => {
-                                instrs.push(Instr::TypeEq(t));
+                            IrType::Optional { ty: inner_ty, .. } => {
+                                match inner_ty {
+                                    IrType::F64 => {
+                                        instrs.push(Instr::F64Ne);
+                                    },
+                                    IrType::I32 | IrType::Bool | IrType::Fn { .. } => {
+                                        instrs.push(Instr::I32Ne);
+                                    },
+                                    IrType::Temp { .. } | IrType::Never | IrType::Unit => {
+                                        panic!(
+                                            "Cannot compare values of type {:?} for inequality",
+                                            ty
+                                        );
+                                    },
+                                    IrType::Ref { ty, .. } => {
+                                        instrs.push(Instr::TypeEq(ty));
+                                        instrs.push(Instr::I32Eqz);
+                                    },
+                                    IrType::Struct { .. }
+                                    | IrType::Tuple { .. }
+                                    | IrType::Array { .. } => {
+                                        instrs.push(Instr::TypeEq(ty));
+                                        instrs.push(Instr::I32Eqz);
+                                    },
+                                    IrType::Optional { .. } => {
+                                        unimplemented!("Nested optionals not supported");
+                                    },
+                                }
+                            },
+                            IrType::Struct { .. } | IrType::Tuple { .. } | IrType::Array { .. } => {
+                                instrs.push(Instr::TypeEq(ty));
                                 instrs.push(Instr::I32Eqz);
                             },
                         }
@@ -1246,7 +1296,7 @@ impl Expr {
                 instrs.extend(expr.compile_wasm());
                 match ty {
                     IrType::F64 => {
-                        unimplemented!("WASM code generation for optional f64 not implemented");
+                        unimplemented!("unwrapping optional f64 type not implemented");
                     },
                     IrType::Temp { .. } | IrType::Never | IrType::Unit => {
                         panic!("Cannot unwrap optional of type {:?}", ty);

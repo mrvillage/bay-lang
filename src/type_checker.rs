@@ -230,5 +230,6 @@ fn check_ownership() -> Result<()> {
     for val in Value::all_mut() {
         val.check_ownership()?;
     }
+    println!("{:#?}", Value::all());
     Ok(())
 }
