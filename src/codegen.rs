@@ -383,7 +383,10 @@ pub fn codegen() -> Result<()> {
     for val in IrValue::all() {
         if let IrValue::Fn { id, orig_id, .. } = val {
             if *orig_id == PRINT_I32_VALUE_ID {
-                wat += &format!("(func $fn{} (param i32))\n", id);
+                wat += &format!(
+                    "(func $fn{} (param i32)\nlocal.get 0\ncall $print_i32)\n",
+                    id
+                );
             } else {
                 wat += &Wasm32Backend::compile_function(val).to_wat();
             }

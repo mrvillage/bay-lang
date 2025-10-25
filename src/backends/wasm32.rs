@@ -693,6 +693,7 @@ impl Expr {
                 instrs.push(Instr::Block(*label as u64));
                 instrs.push(Instr::Loop(*label as u64));
                 instrs.extend(body.compile_wasm());
+                instrs.push(Instr::BrLoop(*label as u64));
                 instrs.push(Instr::End);
                 instrs.push(Instr::End);
             },
