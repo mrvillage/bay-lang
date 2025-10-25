@@ -25,6 +25,8 @@ pub enum CompileError {
     Error(Span, String),
     /// Unimplemented feature
     Unimplemented(Span, &'static str),
+    /// No main function found
+    NoMainFunction,
 }
 
 impl CompileError {
@@ -90,6 +92,9 @@ impl CompileError {
             },
             CompileError::Unimplemented(span, msg) => {
                 span.print(format!("unimplemented: {}", msg), crate::Level::Error);
+            },
+            CompileError::NoMainFunction => {
+                tracing::error!("no main function found");
             },
         }
     }

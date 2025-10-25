@@ -15,8 +15,6 @@ pub fn type_check(source: concrete::Source) -> Result<()> {
     //    operator type checking and stuff (otherwise it wouldn't be able to resolve
     //    the types)
     infer_types()?;
-    println!("{:#?}", Type::all());
-    println!("{:#?}", Value::all());
     // 6. finally, we check ownership rules
     check_ownership()?;
     Ok(())
@@ -50,6 +48,36 @@ fn to_hir(source: concrete::Source) -> Result<&'static Scope> {
             scope:      pkg_root,
         },
     )?;
+    global_root.new_value(
+        token::Ident {
+            value: "print_i32",
+            span:  Span::dummy(),
+        },
+        Value::Fn {
+            id:         PRINT_I32_VALUE_ID,
+            visibility: Visibility::Public,
+            name:       token::Ident {
+                value: "print_i32",
+                span:  Span::dummy(),
+            },
+            ret_ty:     MaybeType::Resolved(&Type::Unit),
+            params:     vec![(
+                token::Ident {
+                    value: "value",
+                    span:  Span::dummy(),
+                },
+                MaybeType::Resolved(&Type::I32),
+                None,
+            )],
+            body:       Box::new(hir::Block {
+                stmts: vec![],
+                span:  Span::dummy(),
+                ty:    MaybeType::Inferred,
+                scope: global_root.inherit_all()?,
+            }),
+            ty:         MaybeType::Inferred,
+        },
+    )?;
     // our package
     assert!(pkg_root.id == 1);
     for item in source.items {
@@ -74,7 +102,7 @@ fn item_to_scope(item: concrete::Item, scope: &'static Scope) -> Result<()> {
                 params:     item
                     .params
                     .into_iter()
-                    .map(|param| (param.name, MaybeType::Unresolved(param.ty, scope)))
+                    .map(|param| (param.name, MaybeType::Unresolved(param.ty, scope), None))
                     .collect(),
                 body:       Box::new(item.body.into_hir(scope)?),
                 ty:         MaybeType::Inferred,
@@ -179,9 +207,6 @@ fn infer_types() -> Result<()> {
     for val in Value::all_mut() {
         val.infer()?;
     }
-    println!("After inference:");
-    println!("{:#?}", Type::all());
-    println!("{:#?}", Value::all());
     // now we need to iterate through and raise errors for any remaining unresolved
     // types
     for val in Value::all() {

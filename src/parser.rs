@@ -947,11 +947,8 @@ impl Parse for LetStmt {
             None
         };
         // optional initializer
-        let expr = if cursor.consume_symbol(Symbol::Equal).is_ok() {
-            Some(Expr::parse(cursor)?)
-        } else {
-            None
-        };
+        cursor.consume_symbol(Symbol::Equal)?;
+        let expr = Some(Expr::parse(cursor)?);
         // optional else clause for destructuring
         let else_expr = if cursor.consume_keyword(Keyword::Else).is_ok() {
             Some(Block::parse(cursor)?)
@@ -1283,8 +1280,17 @@ impl Parse for Expr {
             return cursor.unexpected_end_of_input();
         };
         if let Ok(kind) = ControlFlowKind::parse(cursor) {
+            let label = if kind != ControlFlowKind::Return
+                && cursor.fork().consume_symbol(Symbol::Dollar).is_ok()
+            {
+                Some(Label::parse(cursor)?)
+            } else {
+                None
+            };
             let mut fork = cursor.fork();
-            let expr = if fork.consume_symbol(Symbol::Semicolon).is_ok() {
+            let expr = if kind == ControlFlowKind::Continue
+                || fork.consume_symbol(Symbol::Semicolon).is_ok()
+            {
                 None
             } else {
                 let expr = RangeExpr::parse(cursor)?;
@@ -1298,7 +1304,12 @@ impl Parse for Expr {
                 Some(Box::new(expr))
             };
             let span = span.join(cursor.prev_span());
-            Ok(Expr::ControlFlow { kind, expr, span })
+            Ok(Expr::ControlFlow {
+                kind,
+                label,
+                expr,
+                span,
+            })
         } else {
             AssignExpr::parse(cursor).map(Box::new).map(Expr::Assign)
         }
@@ -1413,6 +1424,8 @@ impl Parse for ControlFlowKind {
             Ok(ControlFlowKind::Return)
         } else if cursor.consume_keyword(Keyword::Break).is_ok() {
             Ok(ControlFlowKind::Break)
+        } else if cursor.consume_keyword(Keyword::Continue).is_ok() {
+            Ok(ControlFlowKind::Continue)
         } else {
             let Some(token) = cursor.peek() else {
                 return cursor.unexpected_end_of_input();

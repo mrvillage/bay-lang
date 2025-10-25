@@ -38,6 +38,16 @@ pub struct Package {
     version: Version,
 }
 
+impl Package {
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub fn version(&self) -> &Version {
+        &self.version
+    }
+}
+
 #[derive(Debug)]
 pub struct Dependency {
     name:    String,
@@ -195,7 +205,17 @@ impl Config {
         };
         let package = Package {
             name:    match package_value.get("name") {
-                Some(toml::Value::String(name)) => name.clone(),
+                Some(toml::Value::String(name)) => {
+                    if name
+                        .chars()
+                        .any(|c| !c.is_ascii_alphanumeric() && c != '-' && c != '_')
+                    {
+                        return Err(CompileError::InvalidConfig(
+                            "project name must be alphanumeric, dashes, or underscores",
+                        ));
+                    }
+                    name.clone()
+                },
                 _ => {
                     return Err(CompileError::InvalidConfig(
                         "missing `name` field in `package` section",
@@ -297,7 +317,7 @@ impl Config {
             "version".to_string(),
             toml::Value::String(self.package.version.to_string()),
         );
-        toml.insert("package".to_string(), toml::Value::Table(package));
+        let package = toml::Value::Table(package);
         let mut dependencies = toml::map::Map::new();
         for dep in &self.dependencies {
             let mut dep_table = toml::map::Map::new();
@@ -307,7 +327,7 @@ impl Config {
             );
             dependencies.insert(dep.name.clone(), toml::Value::Table(dep_table));
         }
-        toml.insert("dependencies".to_string(), toml::Value::Table(dependencies));
+        let dependencies = toml::Value::Table(dependencies);
         let mut dev_dependencies = toml::map::Map::new();
         for dep in &self.dev_dependencies {
             let mut dep_table = toml::map::Map::new();
@@ -317,12 +337,63 @@ impl Config {
             );
             dev_dependencies.insert(dep.name.clone(), toml::Value::Table(dep_table));
         }
-        toml.insert(
-            "dev-dependencies".to_string(),
-            toml::Value::Table(dev_dependencies),
-        );
-        let toml = toml::Value::Table(toml);
-        toml::ser::to_string_pretty(&toml)
-            .map_err(|_| CompileError::InvalidConfig("failed to serialize config"))
+        let dev_dependencies = toml::Value::Table(dev_dependencies);
+        Ok(format!(
+            "[package]\n{}\n[dependencies]\n{}\n[dev-dependencies]\n{}",
+            toml::ser::to_string_pretty(&package)
+                .map_err(|_| CompileError::InvalidConfig("failed to serialize config"))?,
+            toml::ser::to_string_pretty(&dependencies)
+                .map_err(|_| CompileError::InvalidConfig("failed to serialize config"))?,
+            toml::ser::to_string_pretty(&dev_dependencies)
+                .map_err(|_| CompileError::InvalidConfig("failed to serialize config"))?,
+        ))
+    }
+
+    pub fn new_project(name: &str) -> Result<()> {
+        let current_dir = std::env::current_dir()?;
+        if name
+            .chars()
+            .any(|c| !c.is_ascii_alphanumeric() && c != '-' && c != '_')
+        {
+            return Err(CompileError::InvalidConfig(
+                "project name must be alphanumeric, dashes, or underscores",
+            ));
+        }
+        let name = name.replace('-', "_");
+        let project_dir = current_dir.join(&name);
+        if project_dir.exists() {
+            return Err(CompileError::InvalidConfig(
+                "project directory already exists",
+            ));
+        }
+        std::fs::create_dir(&project_dir)?;
+        let src_dir = project_dir.join("src");
+        std::fs::create_dir(&src_dir)?;
+        let main_file = src_dir.join("main.bay");
+        std::fs::write(
+            &main_file,
+            r#"fn main() {
+    print_i32(42);
+}"#,
+        )?;
+        let config = Config {
+            package:          Package {
+                name:    name.to_string(),
+                version: Version {
+                    major:       0,
+                    minor:       1,
+                    patch:       0,
+                    pre_release: None,
+                    metadata:    None,
+                },
+            },
+            dependencies:     Vec::new(),
+            dev_dependencies: Vec::new(),
+            root:             project_dir.clone(),
+        };
+        let toml = config.to_toml()?;
+        let config_file = project_dir.join("bay.toml");
+        std::fs::write(&config_file, toml)?;
+        Ok(())
     }
 }

@@ -1,6 +1,8 @@
 #![allow(static_mut_refs)]
 #![allow(invalid_reference_casting)]
 
+mod backends;
+mod codegen;
 mod config;
 mod error;
 mod parser;
@@ -13,6 +15,7 @@ mod type_checker;
 
 use clap::Parser;
 use clap_verbosity_flag::InfoLevel;
+use dashmap::DashMap;
 pub use prelude::*;
 
 use crate::type_checker::type_check;
@@ -52,7 +55,20 @@ impl Span {
         let lines: Vec<&str> = content.lines().collect();
         let max_line_num_len = lines.len().to_string().len();
         if self.line == 0 || self.line > lines.len() {
-            tracing::error!("invalid line number in span");
+            println!(
+                "{}{}{ANSI_END}: {}",
+                match level {
+                    Level::Error => ANSI_RED,
+                    Level::Warning => ANSI_YELLOW,
+                    Level::Hint => ANSI_BLUE,
+                },
+                match level {
+                    Level::Error => "error",
+                    Level::Warning => "warning",
+                    Level::Hint => "hint",
+                },
+                msg.as_ref(),
+            );
             return;
         }
         let line = lines[self.line - 1];
@@ -143,7 +159,7 @@ impl Span {
                 "",
                 "^".repeat(self.end - self.start),
                 len = max_line_num_len,
-                width = self.col - 2 + max_line_num_len
+                width = self.col + max_line_num_len - 2
             );
         }
     }
@@ -190,6 +206,8 @@ struct Cli {
 
 #[derive(Debug, Parser)]
 enum Command {
+    /// New project
+    New { name: String },
     /// Compile the project
     Build {
         #[arg(short, long)]
@@ -223,8 +241,20 @@ fn main() {
         scope::TYPE_STORE = Some(store::Store::new());
         scope::VALUE_STORE = Some(store::Store::new());
         scope::SCOPE_STORE = Some(store::Store::new());
+        crate::reprs::ir::IR_VALUE_STORE = Some(store::Store::new());
+        crate::reprs::ir::IR_VALUE_MAPPING = Some(DashMap::new());
+        crate::reprs::ir::IR_TYPE_STORE = Some(store::Store::new());
+        crate::reprs::ir::IR_TYPE_MAPPING = Some(DashMap::new());
     }
     let cli = Cli::parse();
+    if let Some(Command::New { name }) = &cli.command {
+        if let Err(e) = config::Config::new_project(name) {
+            e.log();
+            std::process::exit(1);
+        }
+        println!("Created new project: {}", name);
+        return;
+    }
 
     tracing_subscriber::fmt()
         .with_max_level(cli.verbosity)
@@ -259,33 +289,34 @@ fn main() {
         tracing::error!("src/main.bay is not a file");
         std::process::exit(1);
     }
+
+    fn build(main: &std::path::Path) -> Result<()> {
+        let tokens = tokenizer::tokenize(main)?;
+        let items = parser::parse(&tokens)?;
+        type_check(items)?;
+        codegen::codegen()?;
+        Ok(())
+    }
     match cli.command {
         Some(Command::Build { release: _ }) => {
-            match tokenizer::tokenize(main.as_path()) {
-                Ok(tokens) => {
-                    match parser::parse(&tokens) {
-                        Ok(items) => {
-                            match type_check(items) {
-                                Ok(_) => {
-                                    println!("Build succeeded");
-                                },
-                                Err(e) => {
-                                    e.log();
-                                    std::process::exit(1);
-                                },
-                            }
-                        },
-                        Err(e) => {
-                            e.log();
-                            std::process::exit(1);
-                        },
-                    }
-                },
-                Err(e) => {
-                    e.log();
-                    std::process::exit(1);
-                },
+            if let Err(e) = build(&main) {
+                e.log();
+                std::process::exit(1);
             }
+        },
+        Some(Command::Run { release: _ }) => {
+            if let Err(e) = build(&main) {
+                e.log();
+                std::process::exit(1);
+            }
+            let path = config().root().join("out").join(format!(
+                "{}.wasm",
+                config().package().name().replace('-', "_")
+            ));
+            std::process::Command::new("wasmtime")
+                .arg(path)
+                .status()
+                .expect("failed to execute process");
         },
         _ => {
             println!("Not implemented yet");

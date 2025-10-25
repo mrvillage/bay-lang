@@ -47,6 +47,18 @@ where T: InitStore
             items
         }
     }
+
+    pub fn get(&self, id: u64) -> Option<&'static T> {
+        unsafe { self.items.get(&id).map(|x| &*(&*x as *const T)) }
+    }
+
+    pub fn get_mut(&self, id: u64) -> Option<&'static mut T> {
+        unsafe {
+            self.items
+                .get_mut(&id)
+                .map(|mut x| &mut *(&mut *x as *mut T))
+        }
+    }
 }
 
 impl<T> Default for Store<T>

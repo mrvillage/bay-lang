@@ -279,6 +279,66 @@ impl PartialEq for Type {
     }
 }
 
+impl Eq for Type {}
+
+impl std::hash::Hash for Type {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        match self {
+            Type::Never => {
+                NEVER_TYPE_ID.hash(state);
+            },
+            Type::Unit => {
+                UNIT_TYPE_ID.hash(state);
+            },
+            Type::I32 => {
+                I32_TYPE_ID.hash(state);
+            },
+            Type::F64 => {
+                F64_TYPE_ID.hash(state);
+            },
+            Type::Bool => BOOL_TYPE_ID.hash(state),
+            Type::Struct { id, .. } => {
+                id.hash(state);
+            },
+            Type::Enum { id, .. } => {
+                id.hash(state);
+            },
+            Type::Module { id, .. } => {
+                id.hash(state);
+            },
+            Type::Tuple { fields, .. } => {
+                "tuple".hash(state);
+                fields.hash(state);
+            },
+            Type::Array { ty, length, .. } => {
+                "array".hash(state);
+                ty.hash(state);
+                length.hash(state);
+            },
+            Type::Slice { ty, .. } => {
+                // need to hash something else otherwise this will collide with the inner type
+                "optional".hash(state);
+                ty.hash(state);
+            },
+            Type::Ref { ty, .. } => {
+                "ref".hash(state);
+                ty.hash(state);
+            },
+            Type::Optional { ty, .. } => {
+                "optional".hash(state);
+                ty.hash(state);
+            },
+            Type::Fn {
+                param_tys, ret_ty, ..
+            } => {
+                "fn".hash(state);
+                param_tys.hash(state);
+                ret_ty.hash(state);
+            },
+        }
+    }
+}
+
 pub const NEVER_TYPE_ID: u64 = 0;
 pub const UNIT_TYPE_ID: u64 = 1;
 pub const I32_TYPE_ID: u64 = 2;
@@ -325,7 +385,7 @@ pub enum Value {
         visibility: Visibility,
         name:       token::Ident,
         ret_ty:     MaybeType,
-        params:     Vec<(token::Ident, MaybeType)>,
+        params:     Vec<(token::Ident, MaybeType, Option<&'static Value>)>,
         body:       Box<hir::Block>,
         ty:         MaybeType,
     },
@@ -410,10 +470,29 @@ impl Value {
             Value::Fn { name, .. } => name,
         }
     }
+
+    pub fn get_by_id(id: u64) -> Option<&'static Value> {
+        unsafe {
+            VALUE_STORE
+                .as_ref()
+                .unwrap()
+                .items
+                .get(&id)
+                .map(|x| &*(&*x as *const Value))
+        }
+    }
 }
 
+pub const PRINT_I32_VALUE_ID: u64 = 1;
+pub const FIRST_NON_RESERVED_VALUE_ID: u64 = 2;
+
 impl InitStore for Value {
-    fn init_store(_: &mut Store<Value>) {}
+    fn init_store(store: &mut Store<Value>) {
+        store.next_id.store(
+            FIRST_NON_RESERVED_VALUE_ID,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
 }
 
 pub fn create_scope(
@@ -512,7 +591,7 @@ impl Scope {
         }
     }
 
-    pub fn new_value(&self, name: token::Ident, mut val: Value) -> Result<()> {
+    pub fn new_value(&self, name: token::Ident, mut val: Value) -> Result<&'static Value> {
         unsafe {
             let store = SCOPE_STORE.as_ref().unwrap();
             let mut scope = store.items.get_mut(&self.id).unwrap();
@@ -520,14 +599,19 @@ impl Scope {
                 scope.value_ns = Some(DashMap::new());
             }
             let value_store = VALUE_STORE.as_ref().unwrap();
-            let id = value_store
-                .next_id
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            match &mut val {
-                Value::Const { id: val_id, .. } => *val_id = id,
-                Value::Var { id: val_id, .. } => *val_id = id,
-                Value::Fn { id: val_id, .. } => *val_id = id,
-            }
+            let id = if val.id() < FIRST_NON_RESERVED_VALUE_ID && val.id() != 0 {
+                self.id
+            } else {
+                let id = value_store
+                    .next_id
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                match &mut val {
+                    Value::Const { id: val_id, .. } => *val_id = id,
+                    Value::Var { id: val_id, .. } => *val_id = id,
+                    Value::Fn { id: val_id, .. } => *val_id = id,
+                }
+                id
+            };
             value_store.items.insert(id, val);
             let val_ref = &*(&*value_store.items.get(&id).unwrap() as *const Value);
             if scope.value_ns.as_ref().unwrap().contains_key(name.value) {
@@ -537,8 +621,8 @@ impl Scope {
                 ));
             }
             scope.value_ns.as_ref().unwrap().insert(name.value, val_ref);
+            Ok(val_ref)
         }
-        Ok(())
     }
 
     pub fn get_by_id(id: u64) -> Option<&'static Scope> {
@@ -784,6 +868,18 @@ impl Scope {
         None
     }
 
+    pub fn label_exists(&self, label: &concrete::Label) -> bool {
+        if let Some((Some(lbl), _)) = &self.break_ty {
+            if lbl == label {
+                return true;
+            }
+        }
+        if let Some(parent) = self.value_parent {
+            return parent.label_exists(label);
+        }
+        false
+    }
+
     pub fn set_return_ty(&self, ty: &'static Type) {
         let this = unsafe { &mut *(self as *const Scope as *mut Scope) };
         this.return_ty = Some(ty);
@@ -792,6 +888,61 @@ impl Scope {
     pub fn set_break_ty(&self, label: Option<concrete::Label>, ty: MaybeType) {
         let this = unsafe { &mut *(self as *const Scope as *mut Scope) };
         this.break_ty = Some((label, ty));
+    }
+
+    pub fn all_vars(&self) -> Vec<(&'static Value, Vec<token::Ident>)> {
+        let mut vars = Vec::new();
+        if let Some(ns) = &self.value_ns {
+            for entry in ns.iter() {
+                if let Value::Var {
+                    partially_moved, ..
+                } = entry.value()
+                {
+                    vars.push((
+                        unsafe { &*(&**entry.value() as *const Value) },
+                        partially_moved.clone(),
+                    ));
+                }
+            }
+        }
+        if let Some(parent) = self.value_parent {
+            vars.extend(parent.all_vars());
+        }
+        vars
+    }
+
+    pub fn all_vars_until_break_ty(
+        &self,
+        label: Option<&concrete::Label>,
+    ) -> Vec<(&'static Value, Vec<token::Ident>)> {
+        let mut vars = Vec::new();
+        if let Some(ns) = &self.value_ns {
+            for entry in ns.iter() {
+                if let Value::Var {
+                    partially_moved, ..
+                } = entry.value()
+                {
+                    vars.push((
+                        unsafe { &*(&**entry.value() as *const Value) },
+                        partially_moved.clone(),
+                    ));
+                }
+            }
+        }
+        if let Some(parent) = self.value_parent {
+            if let Some(label) = label {
+                if let Some((Some(lbl), _)) = &parent.break_ty {
+                    if lbl == label {
+                        return vars;
+                    }
+                }
+            } else if parent.break_ty.is_some() {
+                return vars;
+            } else {
+                vars.extend(parent.all_vars_until_break_ty(label));
+            }
+        }
+        vars
     }
 }
 
@@ -1049,6 +1200,26 @@ impl Type {
                 }
                 .store())
             },
+        }
+    }
+
+    pub fn unary_op_hint(&'static self, op: &hir::UnaryOp) -> Option<&'static Type> {
+        match op {
+            hir::UnaryOp::Neg => {
+                if matches!(self, Type::I32 | Type::F64 | Type::Bool) {
+                    Some(self)
+                } else {
+                    None
+                }
+            },
+            hir::UnaryOp::Not => {
+                if matches!(self, Type::Bool | Type::I32) {
+                    Some(self)
+                } else {
+                    None
+                }
+            },
+            hir::UnaryOp::Ref => None,
         }
     }
 
@@ -1419,15 +1590,6 @@ impl MaybeType {
         match (expected, found) {
             (MaybeType::Inferred, MaybeType::Inferred) => Ok(false),
             (MaybeType::Resolved(expected), MaybeType::Resolved(found)) => {
-                if let Type::Optional {
-                    ty: expected_inner, ..
-                } = expected
-                {
-                    if expected_inner == found {
-                        // found is the inner type of the expected optional, so this is valid
-                        return Ok(false);
-                    }
-                }
                 if expected.is_never() || found.is_never() {
                     // never can be any type, so we treat this as a successful reconciliation
                     return Ok(false);
@@ -1507,6 +1669,12 @@ impl concrete::ConcreteType {
             },
             concrete::ConcreteType::Optional(ty) => {
                 let opt_type = ty.resolve_type(scope)?;
+                if matches!(opt_type, Type::Optional { .. }) {
+                    return Err(CompileError::Error(
+                        self.span(),
+                        "nested optional types are not allowed".to_string(),
+                    ));
+                }
                 Ok(Type::Optional {
                     id: 0,
                     ty: opt_type,
@@ -1583,15 +1751,15 @@ impl Value {
                 };
                 ret_ty.resolve_explicit()?;
                 body.scope.set_return_ty(ret_ty.ty());
-                for (name, ty) in params.iter_mut() {
+                for (name, ty, value) in params.iter_mut() {
                     ty.resolve_explicit()?;
-                    body.scope.new_value(name.clone(), Value::Var {
+                    *value = Some(body.scope.new_value(name.clone(), Value::Var {
                         id:              0,
                         name:            name.clone(),
                         ty:              ty.clone(),
                         moved:           false,
                         partially_moved: Vec::new(),
-                    })?;
+                    })?);
                 }
                 let ret_ty = match ret_ty {
                     MaybeType::Resolved(ty) => {
@@ -1682,7 +1850,7 @@ impl Value {
                         "function return type not fully resolved".to_string(),
                     ));
                 }
-                for (param, param_ty) in params {
+                for (param, param_ty, _) in params {
                     if !param_ty.is_resolved() {
                         return Err(CompileError::Error(
                             param.span,

@@ -207,9 +207,10 @@ pub enum FieldPattern {
 #[derive(Debug, Clone)]
 pub enum Expr {
     ControlFlow {
-        kind: ControlFlowKind,
-        expr: Option<Box<RangeExpr>>,
-        span: Span,
+        kind:  ControlFlowKind,
+        label: Option<Label>,
+        expr:  Option<Box<RangeExpr>>,
+        span:  Span,
     },
     Assign(Box<AssignExpr>),
 }
@@ -490,7 +491,13 @@ pub struct Label {
     pub span: Span,
 }
 
-#[derive(Debug, Clone, Copy)]
+impl std::hash::Hash for Label {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.name.value.hash(state);
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ControlFlowKind {
     Return,
     Break,

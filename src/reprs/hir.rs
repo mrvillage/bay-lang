@@ -95,6 +95,7 @@ pub struct EnumVariant {
 pub enum HirStmt {
     Let {
         pattern:   concrete::IdentPattern,
+        value:     &'static Value,
         ty:        MaybeType,
         expr:      Option<Box<Expr>>,
         else_expr: Option<Block>,
@@ -116,11 +117,6 @@ pub enum Expr {
     Value {
         value: &'static Value,
         span:  Span,
-    },
-    Group {
-        expr: Box<Expr>,
-        ty:   MaybeType,
-        span: Span,
     },
     Tuple {
         expr: Vec<Expr>,
@@ -166,6 +162,7 @@ pub enum Expr {
         kind:  ControlFlowKind,
         label: Option<concrete::Label>,
         expr:  Option<Box<Expr>>,
+        scope: &'static Scope,
         span:  Span,
     },
     Assign {
@@ -457,9 +454,26 @@ impl IntoHir for concrete::Block {
                     if else_expr.is_some() {
                         todo!("else expressions not supposed in let statements yet");
                     }
+                    let ident = match stmt.pattern.clone() {
+                        concrete::IdentPattern::Ident(ident) => ident,
+                        _ => {
+                            todo!("only simple ident patterns supported in let statements for now")
+                        },
+                    };
+                    let value = block_scope.new_value(ident.clone(), Value::Var {
+                        id:              0,
+                        name:            ident,
+                        ty:              if let Some(ty) = stmt.ty.clone() {
+                            MaybeType::Unresolved(ty, block_scope)
+                        } else {
+                            MaybeType::Inferred
+                        },
+                        moved:           false,
+                        partially_moved: Vec::new(),
+                    })?;
                     let hir_stmt = HirStmt::Let {
                         pattern: stmt.pattern.clone(),
-                        ty: if let Some(ty) = stmt.ty.clone() {
+                        ty: if let Some(ty) = stmt.ty {
                             MaybeType::Unresolved(ty, block_scope)
                         } else {
                             MaybeType::Inferred
@@ -468,24 +482,8 @@ impl IntoHir for concrete::Block {
                         else_expr,
                         scope: block_scope,
                         span: stmt.span,
+                        value,
                     };
-                    let ident = match stmt.pattern {
-                        concrete::IdentPattern::Ident(ident) => ident,
-                        _ => {
-                            todo!("only simple ident patterns supported in let statements for now")
-                        },
-                    };
-                    block_scope.new_value(ident.clone(), Value::Var {
-                        id:              0,
-                        name:            ident,
-                        ty:              if let Some(ty) = stmt.ty {
-                            MaybeType::Unresolved(ty, block_scope)
-                        } else {
-                            MaybeType::Inferred
-                        },
-                        moved:           false,
-                        partially_moved: Vec::new(),
-                    })?;
                     // since let statements can introduce new variables, we need to create a new
                     // scope for the next statement
                     block_scope = block_scope.inherit_all()?;
@@ -516,18 +514,24 @@ impl IntoHir for concrete::Expr {
 
     fn into_hir(self, scope: &'static Scope) -> Result<Self::Output> {
         match self {
-            concrete::Expr::ControlFlow { kind, expr, span } => {
+            concrete::Expr::ControlFlow {
+                kind,
+                label,
+                expr,
+                span,
+            } => {
                 Ok(Expr::ControlFlow {
                     kind: match kind {
                         concrete::ControlFlowKind::Return => ControlFlowKind::Return,
                         concrete::ControlFlowKind::Break => ControlFlowKind::Break,
                         concrete::ControlFlowKind::Continue => ControlFlowKind::Continue,
                     },
-                    label: None,
+                    label,
                     expr: match expr {
                         Some(e) => Some(Box::new(e.into_hir(scope)?)),
                         None => None,
                     },
+                    scope,
                     span,
                 })
             },
@@ -914,13 +918,7 @@ impl IntoHir for concrete::PrimaryExpr {
                     ty: MaybeType::Inferred,
                 })
             },
-            concrete::PrimaryExpr::Group { expr, span } => {
-                Ok(Expr::Group {
-                    expr: Box::new(expr.into_hir(scope)?),
-                    ty: MaybeType::Inferred,
-                    span,
-                })
-            },
+            concrete::PrimaryExpr::Group { expr, span } => expr.into_hir(scope),
             concrete::PrimaryExpr::Tuple { elems, span } => {
                 let mut hir_elems = Vec::new();
                 for elem in elems {
@@ -1663,6 +1661,17 @@ impl Literal {
                 if let Some(expected_ty) = expected {
                     ty.reconcile_type(&mut MaybeType::Resolved(expected_ty), *span)?;
                 }
+                if let MaybeType::Resolved(t) = ty {
+                    match t {
+                        Type::I32 => {},
+                        _ => {
+                            return Err(CompileError::Error(
+                                *span,
+                                format!("type mismatch: expected '{}', found integer type", t),
+                            ))
+                        },
+                    }
+                }
                 Ok(!ty.is_inferred())
             },
             Literal::Float { value, ty, span } => {
@@ -1685,6 +1694,17 @@ impl Literal {
                 }
                 if let Some(expected_ty) = expected {
                     ty.reconcile_type(&mut MaybeType::Resolved(expected_ty), *span)?;
+                }
+                if let MaybeType::Resolved(t) = ty {
+                    match t {
+                        Type::F64 => {},
+                        _ => {
+                            return Err(CompileError::Error(
+                                *span,
+                                format!("type mismatch: expected '{}', found float", t),
+                            ))
+                        },
+                    }
                 }
                 Ok(!ty.is_inferred())
             },
@@ -1787,13 +1807,6 @@ impl Expr {
                     }
                 }
             },
-            Expr::Group { expr, ty, span } => {
-                inferred |= expr.infer(scope, expected)?;
-                ty.reconcile_type(expr.ty_mut(), *span)?;
-                if let Some(expected_ty) = expected {
-                    ty.reconcile_type(&mut MaybeType::Resolved(expected_ty), *span)?;
-                }
-            },
             Expr::Tuple { expr, ty, span } => {
                 // if i have an expected type, it must be a tuple type of the same length
                 if let Some(expected_ty) = expected {
@@ -1849,11 +1862,12 @@ impl Expr {
                     }
                 }
             },
+            // ty should be the array type
             Expr::Array { elems, ty, span } => {
                 // if we have an expected type, it must be an array type
                 if let Some(expected_ty) = expected {
                     if let Type::Array {
-                        ty: expected_ty,
+                        ty: elem_ty,
                         length,
                         ..
                     } = expected_ty
@@ -1870,7 +1884,7 @@ impl Expr {
                             ));
                         }
                         for e in elems.iter_mut() {
-                            inferred |= e.infer(scope, Some(*expected_ty))?;
+                            inferred |= e.infer(scope, Some(*elem_ty))?;
                         }
                         ty.reconcile_type(&mut MaybeType::Resolved(expected_ty), *span)?;
                     } else {
@@ -1917,6 +1931,9 @@ impl Expr {
                     } => {
                         // resolve the struct type
                         let struct_ty = scope.resolve_path_type(path)?;
+                        if let Some(rest) = rest {
+                            rest.infer(scope, Some(struct_ty))?;
+                        }
                         if let Type::Struct {
                             fields: struct_fields,
                             ..
@@ -2039,6 +2056,14 @@ impl Expr {
             } => {
                 // for loops, the expected type is the break type, the actual body should return
                 // the unit type
+                if let Some(label) = label {
+                    if body.scope.label_exists(label) {
+                        return Err(CompileError::Error(
+                            *span,
+                            format!("label '{}' already exists in this scope", label.name.value),
+                        ));
+                    }
+                }
                 body.scope.set_break_ty(label.clone(), match expected {
                     Some(t) => MaybeType::Resolved(t),
                     None => MaybeType::Inferred,
@@ -2067,6 +2092,14 @@ impl Expr {
                 span,
             } => {
                 inferred |= condition.infer(scope, Some(&Type::Bool))?;
+                if let Some(label) = label {
+                    if body.scope.label_exists(label) {
+                        return Err(CompileError::Error(
+                            *span,
+                            format!("label '{}' already exists in this scope", label.name.value),
+                        ));
+                    }
+                }
                 body.scope.set_break_ty(label.clone(), match expected {
                     Some(t) => MaybeType::Resolved(t),
                     None => MaybeType::Resolved(&Type::Unit),
@@ -2082,6 +2115,7 @@ impl Expr {
                 kind,
                 label,
                 span,
+                ..
             } => {
                 // control flow expressions always have the never type, since they do not return
                 // a value, just influence control flow
@@ -2332,7 +2366,7 @@ impl Expr {
                 }
             },
             Expr::UnaryOp { op, expr, ty, span } => {
-                inferred |= expr.infer(scope, None)?;
+                inferred |= expr.infer(scope, expected.and_then(|t| t.unary_op_hint(op)))?;
                 if let MaybeType::Resolved(expr_ty) = expr.ty() {
                     ty.reconcile_type(
                         &mut MaybeType::Resolved(expr_ty.unary_op(op, *span)?),
@@ -2478,8 +2512,34 @@ impl Expr {
             },
             Expr::Cast { expr, ty, span } => {
                 ty.resolve_explicit()?;
+                inferred |= expr.infer(scope, None)?;
+                match ty {
+                    MaybeType::Resolved(Type::Optional { ty, .. }) => {
+                        if let MaybeType::Resolved(expr_ty) = expr.ty() {
+                            if *ty == *expr_ty {
+                                // casting to the same type, allow it
+                            } else {
+                                return Err(CompileError::Error(
+                                    *span,
+                                    format!(
+                                        "cannot cast type '{}' to optional type '{}?'",
+                                        expr_ty, ty
+                                    ),
+                                ));
+                            }
+                        }
+                    },
+                    _ => {
+                        // for now, we only allow casting nil to optional types
+                        if let MaybeType::Resolved(expr_ty) = expr.ty() {
+                            return Err(CompileError::Error(
+                                *span,
+                                format!("cannot cast type '{}' to type '{}'", expr_ty, ty.ty()),
+                            ));
+                        }
+                    },
+                }
                 // right now this will only work for nil casts, nothing else can be casted
-                inferred |= expr.infer(scope, ty.ty_opt())?;
                 if let Some(expected_ty) = expected {
                     ty.reconcile_type(&mut MaybeType::Resolved(expected_ty), *span)?;
                 }
@@ -2507,7 +2567,6 @@ impl Expr {
                     ));
                 }
             },
-            Expr::Group { expr, .. } => expr.check_fully_resolved()?,
             Expr::Tuple { expr, span, .. } => {
                 for e in expr.iter() {
                     e.check_fully_resolved()?;
@@ -2533,7 +2592,11 @@ impl Expr {
             Expr::Struct(expr) => {
                 match expr {
                     StructExpr::Named {
-                        fields, ty, span, ..
+                        fields,
+                        ty,
+                        span,
+                        rest,
+                        ..
                     } => {
                         for field in fields.iter() {
                             field.expr.check_fully_resolved()?;
@@ -2544,6 +2607,9 @@ impl Expr {
                                 "the type of this struct expression could not be fully resolved"
                                     .to_string(),
                             ));
+                        }
+                        if let Some(rest_expr) = rest {
+                            rest_expr.check_fully_resolved()?;
                         }
                     },
                     StructExpr::Unnamed { span, .. } => {
@@ -2691,7 +2757,6 @@ impl Expr {
             Expr::UnaryOp { ty, .. } => ty,
             Expr::Literal(lit) => lit.ty(),
             Expr::Path { ty, .. } => ty,
-            Expr::Group { ty, .. } => ty,
             Expr::Tuple { ty, .. } => ty,
             Expr::Array { ty, .. } => ty,
             Expr::Struct(expr) => {
@@ -2729,7 +2794,6 @@ impl Expr {
             Expr::UnaryOp { span, .. } => *span,
             Expr::Literal(lit) => lit.span(),
             Expr::Path { span, .. } => *span,
-            Expr::Group { span, .. } => *span,
             Expr::Tuple { span, .. } => *span,
             Expr::Array { span, .. } => *span,
             Expr::Struct(expr) => {
@@ -2770,9 +2834,6 @@ impl Expr {
                         moveset.returning(value);
                     }
                 }
-            },
-            Expr::Group { expr, .. } => {
-                moveset = expr.check_ownership(moveset, moving)?;
             },
             Expr::Tuple { expr, .. } => {
                 moveset.new_value();
@@ -2868,19 +2929,27 @@ impl Expr {
                 match pattern {
                     concrete::FieldPattern::Field(field) => {
                         let value = value.unwrap();
-                        if field.len() <= 1 {
+                        if field.len() == 1 {
                             // simple variable assignment
                             if !value.ty().ty().is_copy_type() {
                                 (*moved, *partially_moved) = moveset.unmove(value);
                             }
-                        } else {
+                        } else if field.len() == 2 {
                             // field assignment
                             *moved = moveset.unmove_field(value, &field[1]);
+                        } else {
+                            return Err(CompileError::Unimplemented(
+                                *span,
+                                "nested field assignments",
+                            ));
                         }
                         moveset.move_in(value);
                     },
                     _ => {
-                        todo!("only simple ident patterns supported in let statements for now")
+                        return Err(CompileError::Unimplemented(
+                            *span,
+                            "complex patterns in assignment expressions",
+                        ));
                     },
                 }
                 moveset.new_value();
@@ -2898,8 +2967,14 @@ impl Expr {
                 moveset = right.check_ownership(moveset, false)?;
                 moveset.new_value();
             },
-            Expr::UnaryOp { expr, op, .. } => {
+            Expr::UnaryOp { expr, op, ty, .. } => {
                 if let UnaryOp::Ref = op {
+                    if ty.ty().is_copy_type() {
+                        return Err(CompileError::Error(
+                            expr.span(),
+                            "cannot take a reference to a copy type".to_string(),
+                        ));
+                    }
                     // ref needs to keep the value alive
                 } else {
                     moveset.new_value();
@@ -2940,13 +3015,17 @@ impl Expr {
                 if let Expr::Value { .. } = expr.as_ref() {
                     moveset = expr.check_ownership(moveset, false)?;
                     #[allow(clippy::mutable_key_type)]
-                    let possible_values = std::mem::take(&mut moveset.possible_values);
-                    for value in possible_values.iter() {
-                        moveset.add_reference(value.0, Some(field.clone()));
-                        if moving {
-                            moveset.mark_partial_move(value.0, field.clone(), *span)?;
-                        } else {
-                            moveset.check_if_field_accessible(value.0, field, *span)?;
+                    if ty.ty().is_copy_type() {
+                        moveset.new_value();
+                    } else {
+                        let possible_values = std::mem::take(&mut moveset.possible_values);
+                        for value in possible_values.iter() {
+                            moveset.add_reference(value.0, Some(field.clone()));
+                            if moving {
+                                moveset.mark_partial_move(value.0, field.clone(), *span)?;
+                            } else {
+                                moveset.check_if_field_accessible(value.0, field, *span)?;
+                            }
                         }
                     }
                 } else {
@@ -2993,12 +3072,10 @@ impl Expr {
     pub fn is_owned_value(&self) -> bool {
         match self {
             Expr::Literal(_) | Expr::Path { .. } | Expr::Value { .. } => false,
-            Expr::Group { expr, .. } => expr.is_owned_value(),
             Expr::Tuple { .. } => true,
             Expr::Array { .. } => true,
             Expr::Block(_) => true,
             Expr::Struct(_) => true,
-            Expr::Group { expr, .. } => expr.is_owned_value(),
             // blocks always create owned values
             Expr::Block(_) => true,
             Expr::If(_) => true,
