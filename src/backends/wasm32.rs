@@ -1416,11 +1416,8 @@ impl Expr {
                 instrs.push(ty.wasm_load());
             },
             Expr::Index { expr, index, ty } => {
-                instrs.push(Instr::Comment("1"));
                 instrs.extend(expr.compile_wasm());
-                instrs.push(Instr::Comment("2"));
                 instrs.extend(index.compile_wasm());
-                instrs.push(Instr::Comment("3"));
                 let elem_size = match expr.ty() {
                     IrType::Array { ty, .. } => Wasm32Backend::type_size(ty),
                     _ => panic!("Expected array type"),
@@ -1429,7 +1426,6 @@ impl Expr {
                 instrs.push(Instr::I32Mul);
                 instrs.push(Instr::I32Add);
                 instrs.push(ty.wasm_load());
-                instrs.push(Instr::Comment("4"));
             },
             Expr::Cast { expr, .. } => {
                 instrs.extend(expr.compile_wasm());
