@@ -72,6 +72,9 @@ pub enum Instr {
     BrBlock(u64),
 
     CallIndirect(&'static IrType),
+
+    Open,
+    Close,
 }
 
 impl Instr {
@@ -156,6 +159,8 @@ impl Instr {
             Instr::TypeEq(ty) => {
                 format!("call $eq{}", ty.id())
             },
+            Instr::Open => "(".to_string(),
+            Instr::Close => ")".to_string(),
         }
     }
 }
@@ -997,7 +1002,7 @@ impl Expr {
                                     StructFields::Named { fields } => fields,
                                 }
                             },
-                            _ => panic!("Expected struct type"),
+                            _ => panic!("Expected struct type, found {:?}", ty),
                         };
                         let mut offset = 0;
                         for field in field_defs {
@@ -1481,14 +1486,18 @@ impl If {
         let mut instrs = Vec::new();
         // compile condition
         instrs.extend(self.condition.compile_wasm());
+        instrs.push(Instr::Open);
         instrs.push(Instr::If(self.then_block.ty));
-        if self.then_block.ty.is_valued() {
-            // then block
-            instrs.push(Instr::Then);
-        }
+        // if self.then_block.ty.is_valued() {
+        // then block
+        instrs.push(Instr::Open);
+        instrs.push(Instr::Then);
+        // }
         instrs.extend(self.then_block.compile_wasm());
         // else block
         if let Some(else_block) = &self.else_block {
+            instrs.push(Instr::Close);
+            instrs.push(Instr::Open);
             instrs.push(Instr::Else);
             match else_block {
                 ElseBlock::Block(block) => {
@@ -1499,7 +1508,8 @@ impl If {
                 },
             }
         }
-        instrs.push(Instr::End);
+        instrs.push(Instr::Close);
+        instrs.push(Instr::Close);
         instrs
     }
 }
