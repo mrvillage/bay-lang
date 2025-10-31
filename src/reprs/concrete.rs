@@ -197,14 +197,6 @@ pub enum IdentPattern {
 }
 
 #[derive(Debug, Clone)]
-pub enum FieldPattern {
-    Wildcard,
-    // something like a.b.c
-    Field(Vec<token::Ident>),
-    Tuple(Vec<IdentPattern>),
-}
-
-#[derive(Debug, Clone)]
 pub enum Expr {
     ControlFlow {
         kind:  ControlFlowKind,
@@ -218,10 +210,12 @@ pub enum Expr {
 #[derive(Debug, Clone)]
 pub enum AssignExpr {
     Assign {
-        pattern: FieldPattern,
-        op:      AssignOp,
-        expr:    Box<RangeExpr>,
-        span:    Span,
+        var:   token::Ident,
+        field: Option<token::Ident>,
+        idx:   Option<Box<Expr>>,
+        op:    AssignOp,
+        expr:  Box<RangeExpr>,
+        span:  Span,
     },
     Range(Box<RangeExpr>),
 }

@@ -1074,11 +1074,87 @@ impl Expr {
             Expr::Assign {
                 value,
                 field,
+                idx,
                 expr,
                 moved,
                 partially_moved,
             } => {
-                if expr.ty().is_valued() {
+                if let Some(idx_expr) = idx {
+                    // array index assignment
+                    instrs.push(Instr::LocalGet(value.id()));
+                    let arr_ty = match field {
+                        Some(field_name) => {
+                            // struct field which is an array
+                            let field_ty = match value.ty() {
+                                IrType::Struct { fields, .. } => {
+                                    match fields {
+                                        StructFields::Named { fields } => {
+                                            let field = fields
+                                                .iter()
+                                                .find(|x| &x.name == field_name)
+                                                .expect("Field not found in struct");
+                                            field.ty
+                                        },
+                                    }
+                                },
+                                IrType::Ref {
+                                    ty: IrType::Struct { fields, .. },
+                                    ..
+                                } => {
+                                    match fields {
+                                        StructFields::Named { fields } => {
+                                            let field = fields
+                                                .iter()
+                                                .find(|x| &x.name == field_name)
+                                                .expect("Field not found in struct");
+                                            field.ty
+                                        },
+                                    }
+                                },
+                                _ => panic!("Expected struct type"),
+                            };
+                            instrs.push(Instr::I32Const(Wasm32Backend::field_offset(
+                                value.ty(),
+                                field_name,
+                            ) as i32));
+                            instrs.push(Instr::I32Add);
+                            instrs.push(field_ty.wasm_load());
+                            match field_ty {
+                                IrType::Array { .. } => field_ty,
+                                _ => panic!("Expected array type"),
+                            }
+                        },
+                        None => value.ty(),
+                    };
+                    instrs.extend(idx_expr.compile_wasm());
+                    let elem_ty = match arr_ty {
+                        IrType::Array { ty, .. } => ty,
+                        IrType::Ref {
+                            ty: IrType::Array { ty, .. },
+                            ..
+                        } => ty,
+                        _ => panic!("Expected array type"),
+                    };
+                    instrs.push(Instr::I32Const(Wasm32Backend::type_size(elem_ty) as i32));
+                    instrs.push(Instr::I32Mul);
+                    instrs.push(Instr::I32Add);
+                    if elem_ty.wasm_is_allocated() {
+                        // if this is an allocated type, we need to run expr,
+                        // then destruct, then store
+                        instrs.push(Instr::LocalTee(TMP_VAR_ID));
+                        instrs.extend(expr.compile_wasm());
+                        // now we have our stack ready to store, but first we need
+                        instrs.push(Instr::LocalGet(TMP_VAR_ID));
+                        instrs.push(elem_ty.wasm_load());
+                        instrs.push(Instr::Destruct(elem_ty));
+                        // now, our stack is ready to store again
+                        instrs.push(elem_ty.wasm_store());
+                    } else {
+                        // otherwise we can just store
+                        instrs.extend(expr.compile_wasm());
+                        instrs.push(elem_ty.wasm_store());
+                    }
+                } else if expr.ty().is_valued() {
                     if let Some(field) = field {
                         // struct field assignment
                         instrs.push(Instr::LocalGet(value.id()));
@@ -1340,8 +1416,11 @@ impl Expr {
                 instrs.push(ty.wasm_load());
             },
             Expr::Index { expr, index, ty } => {
+                instrs.push(Instr::Comment("1"));
                 instrs.extend(expr.compile_wasm());
+                instrs.push(Instr::Comment("2"));
                 instrs.extend(index.compile_wasm());
+                instrs.push(Instr::Comment("3"));
                 let elem_size = match expr.ty() {
                     IrType::Array { ty, .. } => Wasm32Backend::type_size(ty),
                     _ => panic!("Expected array type"),
@@ -1350,6 +1429,7 @@ impl Expr {
                 instrs.push(Instr::I32Mul);
                 instrs.push(Instr::I32Add);
                 instrs.push(ty.wasm_load());
+                instrs.push(Instr::Comment("4"));
             },
             Expr::Cast { expr, .. } => {
                 instrs.extend(expr.compile_wasm());

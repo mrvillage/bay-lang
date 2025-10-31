@@ -191,6 +191,7 @@ pub enum Expr {
     Assign {
         value:           &'static IrValue,
         field:           Option<token::Ident>,
+        idx:             Option<Box<Expr>>,
         expr:            Box<Expr>,
         moved:           bool,
         partially_moved: Vec<token::Ident>,
@@ -853,7 +854,8 @@ impl hir::Expr {
                 }
             },
             hir::Expr::Assign {
-                pattern,
+                field,
+                idx,
                 op,
                 expr,
                 value,
@@ -863,17 +865,12 @@ impl hir::Expr {
             } => {
                 let expr = expr.into_ir(labels);
                 let value = value.unwrap().into_ir();
-                let field = match pattern {
-                    concrete::FieldPattern::Field(field) => field.get(1),
-                    _ => {
-                        unimplemented!("only single field assignment is supported in IR");
-                    },
-                };
                 match op {
                     concrete::AssignOp::Assign => {
                         Expr::Assign {
                             value,
-                            field: field.cloned(),
+                            field: field.clone(),
+                            idx: idx.as_ref().map(|e| Box::new(e.into_ir(labels))),
                             expr: Box::new(expr),
                             moved: *moved,
                             partially_moved: partially_moved.clone(),

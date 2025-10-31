@@ -1135,69 +1135,6 @@ impl Parse for IdentPattern {
     }
 }
 
-impl Parse for FieldPattern {
-    fn parse(cursor: &mut Cursor) -> Result<Self> {
-        if cursor.consume_symbol(Symbol::Underscore).is_ok() {
-            Ok(FieldPattern::Wildcard)
-        } else if let Ok(ident) = cursor.consume_ident() {
-            let mut field = Vec::new();
-            field.push(ident.clone());
-            while cursor.consume_symbol(Symbol::Dot).is_ok() {
-                let ident = cursor.consume_ident()?;
-                field.push(ident.clone());
-            }
-            Ok(FieldPattern::Field(field))
-        } else if cursor.consume_symbol(Symbol::OpenParen).is_ok() {
-            // it's a tuple pattern
-            let mut elements = Vec::new();
-            while cursor.consume_symbol(Symbol::CloseParen).is_err() {
-                let element = IdentPattern::parse(cursor)?;
-                elements.push(element);
-                if cursor.consume_symbol(Symbol::Comma).is_ok() {
-                    continue;
-                } else if cursor.consume_symbol(Symbol::CloseParen).is_ok() {
-                    break;
-                } else {
-                    return if cursor.is_eof() {
-                        cursor.unexpected_end_of_input()
-                    } else {
-                        Err(CompileError::UnexpectedToken(
-                            cursor.peek().unwrap().span(),
-                            Some("`,` or `)`".to_string()),
-                        ))
-                    };
-                }
-            }
-            Ok(FieldPattern::Tuple(elements))
-        } else if let Some(token) = cursor.peek() {
-            token.unexpected_token(Some("a pattern"))
-        } else {
-            cursor.unexpected_end_of_input()
-        }
-    }
-
-    fn unparse(&self) -> String {
-        match self {
-            FieldPattern::Wildcard => "_".to_string(),
-            FieldPattern::Field(field) => {
-                field
-                    .iter()
-                    .map(|ident| ident.value.to_string())
-                    .collect::<Vec<_>>()
-                    .join(".")
-            },
-            FieldPattern::Tuple(elements) => {
-                let elements = elements
-                    .iter()
-                    .map(|e| e.unparse())
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                format!("({})", elements)
-            },
-        }
-    }
-}
-
 impl Parse for ConcreteType {
     fn parse(cursor: &mut Cursor) -> Result<Self> {
         // ref, slice, array, tuple, path
@@ -1336,13 +1273,33 @@ impl Parse for AssignExpr {
             return cursor.unexpected_end_of_input();
         };
         let mut fork = cursor.fork();
-        if let Ok(pattern) = FieldPattern::parse(&mut fork) {
+        fn parse_pattern(
+            cursor: &mut Cursor,
+        ) -> Result<(token::Ident, Option<token::Ident>, Option<Box<Expr>>)> {
+            let var = cursor.consume_ident()?.clone();
+            let field = if cursor.consume_symbol(Symbol::Dot).is_ok() {
+                Some(cursor.consume_ident()?.clone())
+            } else {
+                None
+            };
+            let idx = if cursor.consume_symbol(Symbol::OpenBracket).is_ok() {
+                let expr = Expr::parse(cursor)?;
+                cursor.consume_symbol(Symbol::CloseBracket)?;
+                Some(Box::new(expr))
+            } else {
+                None
+            };
+            Ok((var, field, idx))
+        }
+        if let Ok((var, field, idx)) = parse_pattern(&mut fork) {
             if let Ok(op) = AssignOp::parse(&mut fork) {
                 cursor.unfork(fork);
                 let expr = RangeExpr::parse(cursor)?;
                 let span = span.join(cursor.prev_span());
                 Ok(AssignExpr::Assign {
-                    pattern,
+                    var,
+                    field,
+                    idx,
                     op,
                     expr: Box::new(expr),
                     span,
@@ -1363,8 +1320,47 @@ impl Parse for AssignExpr {
         match self {
             AssignExpr::Range(expr) => expr.unparse(),
             AssignExpr::Assign {
-                pattern, op, expr, ..
-            } => format!("{} {} {}", pattern.unparse(), op.unparse(), expr.unparse()),
+                var,
+                field,
+                idx,
+                op,
+                expr,
+                ..
+            } => {
+                match (field, idx) {
+                    (Some(field), None) => {
+                        format!(
+                            "{}.{} {} {}",
+                            var.value,
+                            field.value,
+                            op.unparse(),
+                            expr.unparse()
+                        )
+                    },
+                    (None, Some(idx)) => {
+                        format!(
+                            "{}[{}] {} {}",
+                            var.value,
+                            idx.unparse(),
+                            op.unparse(),
+                            expr.unparse()
+                        )
+                    },
+                    (None, None) => {
+                        format!("{} {} {}", var.value, op.unparse(), expr.unparse())
+                    },
+                    (Some(field), Some(idx)) => {
+                        format!(
+                            "{}.{}[{}] {} {}",
+                            var.value,
+                            field.value,
+                            idx.unparse(),
+                            op.unparse(),
+                            expr.unparse()
+                        )
+                    },
+                }
+            },
         }
     }
 }

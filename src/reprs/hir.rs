@@ -166,7 +166,9 @@ pub enum Expr {
         span:  Span,
     },
     Assign {
-        pattern:         concrete::FieldPattern,
+        var:             token::Ident,
+        field:           Option<token::Ident>,
+        idx:             Option<Box<Expr>>,
         op:              concrete::AssignOp,
         expr:            Box<Expr>,
         span:            Span,
@@ -556,13 +558,20 @@ impl IntoHir for concrete::AssignExpr {
     fn into_hir(self, scope: &'static Scope) -> Result<Self::Output> {
         match self {
             concrete::AssignExpr::Assign {
-                pattern,
+                var,
+                field,
+                idx,
                 op,
                 expr,
                 span,
             } => {
                 Ok(Expr::Assign {
-                    pattern,
+                    var,
+                    field,
+                    idx: match idx {
+                        Some(e) => Some(Box::new(e.into_hir(scope)?)),
+                        None => None,
+                    },
                     op,
                     expr: Box::new(expr.into_hir(scope)?),
                     span,
@@ -1624,19 +1633,19 @@ impl Moveset {
         self.possible_values.clear();
     }
 
-    pub fn invalidate_references(&mut self, value: &'static Value) {}
-
-    pub fn move_in(&mut self, value: &'static Value) {
-        // invalidate all references to this value
-        for (key, values) in self.referencing.iter_mut() {
-            if key.0 == value {
-                *values = values.iter().map(|(v, _)| (*v, false)).collect();
+    pub fn move_in(&mut self, value: &'static Value, invalidate: bool) {
+        if invalidate {
+            // invalidate all references to this value
+            for (key, values) in self.referencing.iter_mut() {
+                if key.0 == value {
+                    *values = values.iter().map(|(v, _)| (*v, false)).collect();
+                }
             }
-        }
-        // remove all references from this value
-        for (key, values) in &mut self.referencing {
-            values.remove(&(value, true));
-            values.remove(&(value, false));
+            // remove all references from this value
+            for (key, values) in &mut self.referencing {
+                values.remove(&(value, true));
+                values.remove(&(value, false));
+            }
         }
         // insert all new references from this value
         for reference in &self.references {
@@ -2225,27 +2234,23 @@ impl Expr {
                 }
             },
             Expr::Assign {
-                pattern,
+                var,
+                field,
+                idx,
                 op,
                 expr,
                 span,
                 value,
                 ..
             } => {
-                let field = match pattern {
-                    concrete::FieldPattern::Field(ident) => ident,
-                    _ => {
-                        todo!("only simple ident patterns supported in let statements for now")
-                    },
-                };
-                *value = Some(scope.resolve_name_value(&field[0])?);
-                let val = scope.resolve_name_value_mut(&field[0])?;
+                *value = Some(scope.resolve_name_value(var)?);
+                let val = scope.resolve_name_value_mut(var)?;
                 match val {
                     Value::Var { ty: val_ty, .. } => {
                         if let MaybeType::Resolved(mut current_ty) = val_ty {
                             // now, we need to perform a series of field accesses to get the final
                             // type
-                            for f in &field[1..] {
+                            if let Some(f) = field {
                                 current_ty = match current_ty {
                                     Type::Ref { ty, .. } => ty,
                                     _ => current_ty,
@@ -2294,6 +2299,25 @@ impl Expr {
                                         return Err(CompileError::Error(
                                             *span,
                                             format!("type '{}' has no fields", current_ty),
+                                        ));
+                                    },
+                                }
+                            }
+                            if let Some(index_expr) = idx {
+                                inferred |= index_expr.infer(scope, Some(&Type::I32))?;
+                                // indexing into the current type
+                                current_ty = match current_ty {
+                                    Type::Ref { ty, .. } => ty,
+                                    _ => current_ty,
+                                };
+                                match current_ty {
+                                    Type::Array { ty: elem_ty, .. } => {
+                                        current_ty = elem_ty;
+                                    },
+                                    _ => {
+                                        return Err(CompileError::Error(
+                                            *span,
+                                            format!("type '{}' is not indexable", current_ty),
                                         ));
                                     },
                                 }
@@ -2355,7 +2379,7 @@ impl Expr {
                     _ => {
                         return Err(CompileError::Error(
                             *span,
-                            format!("cannot assign to non-variable '{}'", field[0].value),
+                            format!("cannot assign to non-variable '{}'", var.value),
                         ));
                     },
                 }
@@ -3035,39 +3059,55 @@ impl Expr {
             },
             Expr::Assign {
                 expr,
-                pattern,
+                var,
+                field,
+                idx,
                 value,
                 moved,
                 partially_moved,
                 span,
                 ..
             } => {
-                moveset.new_value();
-                moveset = expr.check_ownership(moveset, true)?;
-                match pattern {
-                    concrete::FieldPattern::Field(field) => {
-                        let value = value.unwrap();
-                        if field.len() == 1 {
-                            // simple variable assignment
-                            if !value.ty().ty().is_copy_type() {
-                                (*moved, *partially_moved) = moveset.unmove(value);
-                            }
-                        } else if field.len() == 2 {
-                            // field assignment
-                            *moved = moveset.unmove_field(value, &field[1]);
-                        } else {
-                            return Err(CompileError::Unimplemented(
+                match idx {
+                    Some(idx) => {
+                        moveset.new_value();
+                        moveset = idx.check_ownership(moveset, true)?;
+                        moveset.new_value();
+                        moveset = expr.check_ownership(moveset, true)?;
+                        if *moved {
+                            return Err(CompileError::Error(
                                 *span,
-                                "nested field assignments",
+                                "cannot assign to a moved value".to_string(),
                             ));
                         }
-                        moveset.move_in(value);
+                        if let Some(field) = field {
+                            if partially_moved.contains(field) {
+                                return Err(CompileError::Error(
+                                    *span,
+                                    "cannot assign to a partially moved value".to_string(),
+                                ));
+                            }
+                        }
+                        let value = value.unwrap();
+                        moveset.move_in(value, false);
                     },
-                    _ => {
-                        return Err(CompileError::Unimplemented(
-                            *span,
-                            "complex patterns in assignment expressions",
-                        ));
+                    None => {
+                        moveset.new_value();
+                        moveset = expr.check_ownership(moveset, true)?;
+                        let value = value.unwrap();
+                        match field {
+                            None => {
+                                // simple variable assignment
+                                if !value.ty().ty().is_copy_type() {
+                                    (*moved, *partially_moved) = moveset.unmove(value);
+                                }
+                            },
+                            Some(field) => {
+                                // field assignment
+                                *moved = moveset.unmove_field(value, field);
+                            },
+                        }
+                        moveset.move_in(value, true);
                     },
                 }
                 moveset.new_value();
@@ -3173,12 +3213,9 @@ impl Expr {
                 expr, index, ty, ..
             } => {
                 moveset.new_value();
-                moveset = expr.check_ownership(moveset, false)?;
-                #[allow(clippy::mutable_key_type)]
-                let possible_values = std::mem::take(&mut moveset.possible_values);
-                moveset.new_value();
                 moveset = index.check_ownership(moveset, true)?;
                 moveset.new_value();
+                moveset = expr.check_ownership(moveset, false)?;
                 if !ty.ty().is_copy_type() {
                     if moving {
                         return Err(CompileError::Error(
