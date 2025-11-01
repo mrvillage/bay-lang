@@ -1,0 +1,15 @@
+fn main() {
+    let state = new State { values: [1, 2, 3] };
+    state.values[0] = 4;
+    state.values[1] = 5;
+    state.values[2] = 6;
+    let i: i32 = 0;
+    while i < 3 {
+        print_i32(state.values[i]);
+        i = i + 1;
+    }
+}
+
+struct State {
+    values: [i32; 3],
+}

@@ -1,0 +1,49 @@
+fn main() {
+    // unspecified fields default to nil
+    // since next requires a Node?, we need to use the ? operator to cast from Node to Node? (type checking will do this automatically in the future)
+    let list = new Node { value: 0, next: new Node { value: 1 }? };
+    append(&list, 2);
+    append(&list, 3);
+    print(&list);
+    found(&list, 2);
+    found(&list, 4);
+}
+
+struct Node {
+    value: i32,
+    next: Node?,
+}
+
+fn append(node: &Node, value: i32) {
+    if node.next == nil {
+        node.next = new Node { value }?;
+    } else {
+        // we use the ! postfix operator to assert a Node? is actually a Node, if the value is nil then the program will crash
+        append(&node.next!, value)
+    }
+}
+
+fn print(node: &Node) {
+    print_i32(node.value);
+    if node.next != nil {
+        print(&node.next!);
+    }
+}
+
+fn find(node: &Node, value: i32) -> bool {
+    if node.value == value {
+        true
+    } else if node.next != nil {
+        find(&node.next!, value)
+    } else {
+        false
+    }
+}
+
+fn found(node: &Node, value: i32) {
+    if find(node, value) {
+        print_i32(1111);
+    } else {
+        print_i32(2222);
+    }
+}

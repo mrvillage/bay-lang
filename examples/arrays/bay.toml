@@ -1,0 +1,6 @@
+[package]
+name = "arrays"
+
+[dependencies]
+
+[dev-dependencies]
