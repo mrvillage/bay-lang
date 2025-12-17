@@ -43,7 +43,7 @@ impl std::fmt::Debug for Scope {
             // .field("type_parent", &self.type_parent.as_ref().map(|s| s.id))
             // .field("type_ns", &self.type_ns.as_ref().map(|ns| ns.len()))
             // .field("value_parent", &self.value_parent.as_ref().map(|s| s.id))
-            .field("value_ns", &self.value_ns)
+            // .field("value_ns", &self.value_ns)
             // .field(
             //     "includes",
             //     &self.includes.iter().map(|s| s.id).collect::<Vec<_>>(),

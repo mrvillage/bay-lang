@@ -247,6 +247,10 @@ fn main() {
         crate::reprs::ir::IR_TYPE_MAPPING = Some(DashMap::new());
     }
     let cli = Cli::parse();
+    tracing_subscriber::fmt()
+        .with_max_level(cli.verbosity)
+        .init();
+
     if let Some(Command::New { name }) = &cli.command {
         if let Err(e) = config::Config::new_project(name) {
             e.log();
@@ -255,10 +259,6 @@ fn main() {
         println!("Created new project: {}", name);
         return;
     }
-
-    tracing_subscriber::fmt()
-        .with_max_level(cli.verbosity)
-        .init();
 
     let c = match config::Config::read() {
         Ok(config) => config,
