@@ -1,0 +1,27 @@
+type Grade = 0..=12;
+type VeryLarge = -9_223_372_036_854_775_807..=9_223_372_036_854_775_807;
+
+fn main() {
+    let v: VeryLarge = -9_223_372;
+    print(v);
+}
+
+fn main2() {
+    let state = new State { values: [1, 2, 3] };
+    state.values[0] = 4;
+    state.values[1] = 5;
+    state.values[2] = 6;
+    let i: i32 = 0;
+    while i < 3 {
+        print_i32(state.values[i] - 4);
+        i = i + 1;
+    }
+    print_i32(1111);
+    let v: VeryLarge = 10;
+    print(v % 3);
+    print(11i32);
+}
+
+struct State {
+    values: [Grade; 3],
+}

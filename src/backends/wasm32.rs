@@ -5,6 +5,7 @@ use crate::{prelude::*, reprs::ir::*};
 #[allow(unused)]
 pub enum Instr {
     Comment(&'static str),
+    Raw(String),
     Nop,
     Drop,
     Unreachable,
@@ -46,12 +47,23 @@ pub enum Instr {
     F64Le,
     F64Ge,
     Local(u64, &'static IrType),
+    VarGet(&'static IrValue),
+    VarSet(&'static IrValue, Vec<Instr>),
+    SpGet,
+    StackSet(&'static IrType, u32, Vec<Instr>),
+    // this is for accessing locals by index, used in some generated code
     LocalGet(u64),
     LocalSet(u64),
-    LocalTee(u64),
+    TmpGet,
+    TmpSet,
+    TmpTee,
 
     Alloc(u32),
     Dealloc,
+    ScAlloc(u32),
+    ScDealloc(u32),
+    ScPut(u32),
+    Memcpy(u32),
     TypeEq(&'static IrType),
     // call the destructor for the given type, one argument is the pointer to the value
     Destruct(&'static IrType),
@@ -75,12 +87,26 @@ pub enum Instr {
 
     Open,
     Close,
+    RangeAdd(&'static IrType),
+    RangeSub(&'static IrType),
+    RangeMul(&'static IrType),
+    RangeDiv(&'static IrType),
+    RangeMod(&'static IrType),
+    RangeNeg(&'static IrType, Vec<Instr>),
+    RangeNot(&'static IrType),
+    RangeEq(&'static IrType),
+    RangeNe(&'static IrType),
+    RangeLt(&'static IrType),
+    RangeLe(&'static IrType),
+    RangeGt(&'static IrType),
+    RangeGe(&'static IrType),
 }
 
 impl Instr {
     pub fn to_wat(&self) -> String {
         match self {
             Instr::Comment(msg) => format!(";; {}", msg),
+            Instr::Raw(code) => code.clone(),
             Instr::Nop => "nop".to_string(),
             Instr::Drop => "drop".to_string(),
             Instr::Unreachable => "unreachable".to_string(),
@@ -122,11 +148,59 @@ impl Instr {
             Instr::F64Le => "f64.le".to_string(),
             Instr::F64Ge => "f64.ge".to_string(),
             Instr::Local(id, ty) => format!("(local $var{} {})", id, ty.to_wat()),
-            Instr::LocalGet(id) => format!("local.get $var{}", id),
-            Instr::LocalSet(id) => format!("local.set $var{}", id),
-            Instr::LocalTee(id) => format!("local.tee $var{}", id),
+            Instr::VarGet(val) => {
+                format!(
+                    ";;here\nlocal.get $sp\ni32.const {}\ni32.add\n{};;here2",
+                    val.offset(),
+                    val.ty().wasm_load().to_wat()
+                )
+            },
+            Instr::VarSet(val, instrs) => {
+                // if ty is unit or never, then we can't store it because it won't exist
+                if val.ty().is_valued() {
+                    format!(
+                        "local.get $sp\ni32.const {}\ni32.add\n{}\n{}",
+                        val.offset(),
+                        instrs
+                            .iter()
+                            .map(|x| format!("  {}\n", x.to_wat()))
+                            .collect::<String>(),
+                        val.ty().wasm_store().to_wat()
+                    )
+                } else {
+                    instrs
+                        .iter()
+                        .map(|x| format!("  {}\n", x.to_wat()))
+                        .collect::<String>()
+                }
+            },
+            Instr::SpGet => "local.get $sp".to_string(),
+            Instr::StackSet(ty, offset, instrs) => {
+                if ty.is_valued() {
+                    format!(
+                        "local.get $sp\ni32.const {}\ni32.sub\n{}\n{}",
+                        offset,
+                        instrs
+                            .iter()
+                            .map(|x| format!("  {}\n", x.to_wat()))
+                            .collect::<String>(),
+                        ty.wasm_store().to_wat()
+                    )
+                } else {
+                    "".to_string()
+                }
+            },
+            Instr::TmpGet => "local.get $tmp".to_string(),
+            Instr::TmpSet => "local.set $tmp".to_string(),
+            Instr::TmpTee => "local.tee $tmp".to_string(),
+            Instr::LocalGet(idx) => format!("local.get {}", idx),
+            Instr::LocalSet(idx) => format!("local.set {}", idx),
             Instr::Alloc(size) => format!("i32.const {}\ncall $alloc", size),
             Instr::Dealloc => "call $dealloc".to_string(),
+            Instr::ScAlloc(size) => format!("i32.const {}\ncall $sc_alloc", size),
+            Instr::ScDealloc(size) => format!("i32.const {}\ncall $sc_dealloc", size),
+            Instr::ScPut(size) => format!("i32.const {}\ncall $sc_put", size),
+            Instr::Memcpy(size) => format!("i32.const {}\ncall $memcpy", size),
             Instr::I32Load => "i32.load".to_string(),
             Instr::I32Store => "i32.store".to_string(),
             Instr::F64Load => "f64.load".to_string(),
@@ -161,6 +235,273 @@ impl Instr {
             },
             Instr::Open => "(".to_string(),
             Instr::Close => ")".to_string(),
+            Instr::RangeAdd(ty) => {
+                let IrType::Range {
+                    start,
+                    end,
+                    inclusive,
+                    ..
+                } = ty
+                else {
+                    panic!("RangeAdd expects a range type");
+                };
+                let words = words(*start, *end, *inclusive);
+                let mut wat = if words == 1 {
+                    "i32.add".to_string()
+                } else {
+                    format!("i32.const {}\ncall $range_add", words)
+                };
+                wat += range_checks(ty)
+                    .iter()
+                    .map(|x| format!("\n{}", x.to_wat()))
+                    .collect::<String>()
+                    .as_str();
+                wat
+            },
+            Instr::RangeSub(ty) => {
+                let IrType::Range {
+                    start,
+                    end,
+                    inclusive,
+                    ..
+                } = ty
+                else {
+                    panic!("RangeSub expects a range type");
+                };
+                let words = words(*start, *end, *inclusive);
+                let mut wat = if words == 1 {
+                    "i32.sub".to_string()
+                } else {
+                    format!("i32.const {}\ncall $range_sub", words)
+                };
+                wat += range_checks(ty)
+                    .iter()
+                    .map(|x| format!("\n{}", x.to_wat()))
+                    .collect::<String>()
+                    .as_str();
+                wat
+            },
+            Instr::RangeMul(ty) => {
+                let IrType::Range {
+                    start,
+                    end,
+                    inclusive,
+                    ..
+                } = ty
+                else {
+                    panic!("RangeMul expects a range type");
+                };
+                let words = words(*start, *end, *inclusive);
+                let mut wat = if words == 1 {
+                    "i32.mul".to_string()
+                } else {
+                    format!("i32.const {}\ncall $range_mul", words)
+                };
+                wat += range_checks(ty)
+                    .iter()
+                    .map(|x| format!("\n{}", x.to_wat()))
+                    .collect::<String>()
+                    .as_str();
+                wat
+            },
+            Instr::RangeDiv(ty) => {
+                let IrType::Range {
+                    start,
+                    end,
+                    inclusive,
+                    ..
+                } = ty
+                else {
+                    panic!("RangeDiv expects a range type");
+                };
+                let words = words(*start, *end, *inclusive);
+                let mut wat = if words == 1 {
+                    "i32.div_s".to_string()
+                } else {
+                    format!("i32.const {}\ncall $range_div", words)
+                };
+                wat += range_checks(ty)
+                    .iter()
+                    .map(|x| format!("\n{}", x.to_wat()))
+                    .collect::<String>()
+                    .as_str();
+                wat
+            },
+            Instr::RangeMod(ty) => {
+                let IrType::Range {
+                    start,
+                    end,
+                    inclusive,
+                    ..
+                } = ty
+                else {
+                    panic!("RangeMod expects a range type");
+                };
+                let words = words(*start, *end, *inclusive);
+                let mut wat = if words == 1 {
+                    "i32.rem_s".to_string()
+                } else {
+                    format!("i32.const {}\ncall $range_mod", words)
+                };
+                wat += range_checks(ty)
+                    .iter()
+                    .map(|x| format!("\n{}", x.to_wat()))
+                    .collect::<String>()
+                    .as_str();
+                wat
+            },
+            Instr::RangeNeg(ty, instrs) => {
+                let IrType::Range {
+                    start,
+                    end,
+                    inclusive,
+                    ..
+                } = ty
+                else {
+                    panic!("RangeNeg expects a range type");
+                };
+                let words = words(*start, *end, *inclusive);
+                let instrs = instrs
+                    .iter()
+                    .map(|x| format!("  {}\n", x.to_wat()))
+                    .collect::<String>();
+                let mut wat = if words == 1 {
+                    format!("i32.const 0\n{}\ni32.sub", instrs)
+                } else {
+                    format!("{}\ni32.const {}\ncall $range_neg", instrs, words)
+                };
+                wat += range_checks(ty)
+                    .iter()
+                    .map(|x| format!("\n{}", x.to_wat()))
+                    .collect::<String>()
+                    .as_str();
+                wat
+            },
+            Instr::RangeNot(ty) => {
+                let IrType::Range {
+                    start,
+                    end,
+                    inclusive,
+                    ..
+                } = ty
+                else {
+                    panic!("RangeNot expects a range type");
+                };
+                let words = words(*start, *end, *inclusive);
+                let mut wat = if words == 1 {
+                    "i32.const -1\ni32.xor".to_string()
+                } else {
+                    format!("i32.const {}\ncall $range_not", words)
+                };
+                wat += range_checks(ty)
+                    .iter()
+                    .map(|x| format!("\n{}", x.to_wat()))
+                    .collect::<String>()
+                    .as_str();
+                wat
+            },
+            Instr::RangeEq(ty) => {
+                let IrType::Range {
+                    start,
+                    end,
+                    inclusive,
+                    ..
+                } = ty
+                else {
+                    panic!("RangeEq expects a range type");
+                };
+                let words = words(*start, *end, *inclusive);
+                if words == 1 {
+                    "i32.eq".to_string()
+                } else {
+                    format!("i32.const {}\ncall $range_eq", words)
+                }
+            },
+            Instr::RangeNe(ty) => {
+                let IrType::Range {
+                    start,
+                    end,
+                    inclusive,
+                    ..
+                } = ty
+                else {
+                    panic!("RangeNe expects a range type");
+                };
+                let words = words(*start, *end, *inclusive);
+                if words == 1 {
+                    "i32.ne".to_string()
+                } else {
+                    format!("i32.const {}\ncall $range_ne", words)
+                }
+            },
+            Instr::RangeLt(ty) => {
+                let IrType::Range {
+                    start,
+                    end,
+                    inclusive,
+                    ..
+                } = ty
+                else {
+                    panic!("RangeNot expects a range type");
+                };
+                let words = words(*start, *end, *inclusive);
+                if words == 1 {
+                    "i32.lt_s".to_string()
+                } else {
+                    format!("i32.const {}\ncall $range_lt", words)
+                }
+            },
+            Instr::RangeLe(ty) => {
+                let IrType::Range {
+                    start,
+                    end,
+                    inclusive,
+                    ..
+                } = ty
+                else {
+                    panic!("RangeLe expects a range type");
+                };
+                let words = words(*start, *end, *inclusive);
+                if words == 1 {
+                    "i32.le_s".to_string()
+                } else {
+                    format!("i32.const {}\ncall $range_le", words)
+                }
+            },
+            Instr::RangeGt(ty) => {
+                let IrType::Range {
+                    start,
+                    end,
+                    inclusive,
+                    ..
+                } = ty
+                else {
+                    panic!("RangeGt expects a range type");
+                };
+                let words = words(*start, *end, *inclusive);
+                if words == 1 {
+                    "i32.gt_s".to_string()
+                } else {
+                    format!("i32.const {}\ncall $range_gt", words)
+                }
+            },
+            Instr::RangeGe(ty) => {
+                let IrType::Range {
+                    start,
+                    end,
+                    inclusive,
+                    ..
+                } = ty
+                else {
+                    panic!("RangeGe expects a range type");
+                };
+                let words = words(*start, *end, *inclusive);
+                if words == 1 {
+                    "i32.ge_s".to_string()
+                } else {
+                    format!("i32.const {}\ncall $range_ge", words)
+                }
+            },
         }
     }
 }
@@ -195,6 +536,22 @@ impl IrType {
             | IrType::Fn { .. } => Instr::I32Store,
             IrType::F64 => Instr::F64Store,
             IrType::Optional { ty, .. } => ty.wasm_store(),
+            IrType::Range {
+                start,
+                end,
+                inclusive,
+                ..
+            } => {
+                // two values on the stack, the pointer to where to store, and
+                // the pointer to the range value, or a straight i32 if the range fits in one
+                // word
+                let words = words(*start, *end, *inclusive);
+                if words == 1 {
+                    Instr::I32Store
+                } else {
+                    Instr::Memcpy(words * 4)
+                }
+            },
         }
     }
 
@@ -212,6 +569,20 @@ impl IrType {
             | IrType::Fn { .. } => Instr::I32Load,
             IrType::F64 => Instr::F64Load,
             IrType::Optional { ty, .. } => ty.wasm_load(),
+            IrType::Range {
+                start,
+                end,
+                inclusive,
+                ..
+            } => {
+                // pointer to where to load from
+                let words = words(*start, *end, *inclusive);
+                if words == 1 {
+                    Instr::I32Load
+                } else {
+                    Instr::ScPut(words * 4)
+                }
+            },
         }
     }
 
@@ -223,6 +594,24 @@ impl IrType {
             },
             IrType::Struct { .. } | IrType::Tuple { .. } | IrType::Array { .. } => true,
             IrType::Optional { ty, .. } => ty.wasm_is_allocated(),
+            IrType::Range { .. } => false,
+        }
+    }
+
+    fn wasm_is_scratch(&self) -> bool {
+        match self {
+            IrType::Temp { .. } | IrType::Never | IrType::Unit => false,
+            IrType::I32 | IrType::F64 | IrType::Bool | IrType::Ref { .. } | IrType::Fn { .. } => {
+                false
+            },
+            IrType::Struct { .. } | IrType::Tuple { .. } | IrType::Array { .. } => false,
+            IrType::Optional { ty, .. } => ty.wasm_is_scratch(),
+            IrType::Range {
+                start,
+                end,
+                inclusive,
+                ..
+            } => words(*start, *end, *inclusive) > 1,
         }
     }
 
@@ -231,13 +620,15 @@ impl IrType {
         match self {
             IrType::Fn {
                 id,
-                ret_ty,
                 param_tys,
+                ret_ty,
                 ..
             } => {
-                wat.push_str(&format!("(type $fn_type{} (func ", id));
-                for param in param_tys {
-                    wat.push_str(&format!("(param {}) ", param.to_wat()));
+                wat.push_str(&format!("(type $fn_type{} (func (param i32) ", id));
+                if !param_tys.is_empty() {
+                    if let IrType::Range { universe: true, .. } = param_tys[0] {
+                        wat.push_str("(param i32) ");
+                    }
                 }
                 if ret_ty.is_valued() {
                     wat.push_str(&format!("(result {}) ", ret_ty.to_wat()));
@@ -246,17 +637,14 @@ impl IrType {
             },
             IrType::Struct { id, fields } => {
                 // destructor function
-                wat.push_str(&format!(
-                    "(func $destruct{} (param $var{TMP_VAR_ID} i32)\n",
-                    id
-                ));
+                wat.push_str(&format!("(func $destruct{} (param $tmp i32)\n", id));
                 let mut instrs = Vec::new();
                 match fields {
                     StructFields::Named { fields } => {
                         let mut offset = 0;
                         for field in fields {
                             if field.ty.wasm_is_allocated() {
-                                instrs.push(Instr::LocalGet(TMP_VAR_ID));
+                                instrs.push(Instr::TmpGet);
                                 instrs.push(Instr::I32Const(offset as i32));
                                 instrs.push(Instr::I32Add);
                                 instrs.push(Instr::I32Load);
@@ -266,7 +654,7 @@ impl IrType {
                         }
                     },
                 }
-                instrs.push(Instr::LocalGet(TMP_VAR_ID));
+                instrs.push(Instr::TmpGet);
                 instrs.push(Instr::Dealloc);
                 wat.push_str(
                     instrs
@@ -277,14 +665,14 @@ impl IrType {
                 );
                 wat.push_str(")\n");
                 wat.push_str(&format!(
-                    "(func $eq{} (param $var1 i32) (param $var2 i32) (result i32)\n",
+                    "(func $eq{} (param i32) (param i32) (result i32)\n",
                     id
                 ));
                 #[allow(clippy::vec_init_then_push)]
                 let mut instrs = Vec::new();
                 // check if they're the same pointer
-                instrs.push(Instr::LocalGet(1)); // var1
-                instrs.push(Instr::LocalGet(2)); // var2
+                instrs.push(Instr::LocalGet(0)); // var1
+                instrs.push(Instr::LocalGet(1)); // var2
                 instrs.push(Instr::I32Eq);
                 instrs.push(Instr::If(&IrType::Unit));
                 instrs.push(Instr::I32Const(1));
@@ -298,11 +686,11 @@ impl IrType {
                                 offset += Wasm32Backend::type_size(field.ty);
                                 continue;
                             }
-                            instrs.push(Instr::LocalGet(1)); // var1
+                            instrs.push(Instr::LocalGet(0)); // var1
                             instrs.push(Instr::I32Const(offset as i32));
                             instrs.push(Instr::I32Add);
                             instrs.push(field.ty.wasm_load());
-                            instrs.push(Instr::LocalGet(2)); // var2
+                            instrs.push(Instr::LocalGet(1)); // var2
                             instrs.push(Instr::I32Const(offset as i32));
                             instrs.push(Instr::I32Add);
                             instrs.push(field.ty.wasm_load());
@@ -352,7 +740,13 @@ impl IrType {
                                         IrType::Optional { .. } => {
                                             unimplemented!("Nested optionals not supported");
                                         },
+                                        IrType::Range { .. } => {
+                                            instrs.push(Instr::RangeEq(ty));
+                                        },
                                     }
+                                },
+                                IrType::Range { .. } => {
+                                    instrs.push(Instr::RangeEq(field.ty));
                                 },
                             }
                             instrs.push(Instr::If(&IrType::Unit));
@@ -375,15 +769,12 @@ impl IrType {
             },
             IrType::Tuple { id, fields } => {
                 // destructor function
-                wat.push_str(&format!(
-                    "(func $destruct{} (param $var{TMP_VAR_ID} i32)\n",
-                    id
-                ));
+                wat.push_str(&format!("(func $destruct{} (param $tmp i32)\n", id));
                 let mut instrs = Vec::new();
                 let mut offset = 0;
                 for field in fields {
                     if field.wasm_is_allocated() {
-                        instrs.push(Instr::LocalGet(TMP_VAR_ID));
+                        instrs.push(Instr::TmpGet);
                         instrs.push(Instr::I32Const(offset as i32));
                         instrs.push(Instr::I32Add);
                         instrs.push(field.wasm_load());
@@ -391,7 +782,7 @@ impl IrType {
                     }
                     offset += Wasm32Backend::type_size(field);
                 }
-                instrs.push(Instr::LocalGet(TMP_VAR_ID));
+                instrs.push(Instr::TmpGet);
                 instrs.push(Instr::Dealloc);
                 wat.push_str(
                     instrs
@@ -402,13 +793,13 @@ impl IrType {
                 );
                 wat.push_str(")\n");
                 wat.push_str(&format!(
-                    "(func $eq{} (param $var1 i32) (param $var2 i32) (result i32)\n",
+                    "(func $eq{} (param i32) (param i32) (result i32)\n",
                     id
                 ));
                 let mut instrs = Vec::new();
                 // check if they're the same pointer
-                instrs.push(Instr::LocalGet(1)); // var1
-                instrs.push(Instr::LocalGet(2)); // var2
+                instrs.push(Instr::LocalGet(0)); // var1
+                instrs.push(Instr::LocalGet(1)); // var2
                 instrs.push(Instr::I32Eq);
                 instrs.push(Instr::If(&IrType::Unit));
                 instrs.push(Instr::I32Const(1));
@@ -420,11 +811,11 @@ impl IrType {
                         offset += Wasm32Backend::type_size(field);
                         continue;
                     }
-                    instrs.push(Instr::LocalGet(1)); // var1
+                    instrs.push(Instr::LocalGet(0)); // var1
                     instrs.push(Instr::I32Const(offset as i32));
                     instrs.push(Instr::I32Add);
                     instrs.push(field.wasm_load());
-                    instrs.push(Instr::LocalGet(2)); // var2
+                    instrs.push(Instr::LocalGet(1)); // var2
                     instrs.push(Instr::I32Const(offset as i32));
                     instrs.push(Instr::I32Add);
                     instrs.push(field.wasm_load());
@@ -466,7 +857,13 @@ impl IrType {
                                 IrType::Optional { .. } => {
                                     unimplemented!("Nested optionals not supported");
                                 },
+                                IrType::Range { .. } => {
+                                    instrs.push(Instr::RangeEq(ty));
+                                },
                             }
+                        },
+                        IrType::Range { .. } => {
+                            instrs.push(Instr::RangeEq(field));
                         },
                     }
                     instrs.push(Instr::If(&IrType::Unit));
@@ -487,32 +884,29 @@ impl IrType {
             },
             IrType::Array { id, ty, length, .. } => {
                 // destructor function
-                wat.push_str(&format!(
-                    "(func $destruct{} (param $var{TMP_VAR_ID} i32)\n",
-                    id
-                ));
+                wat.push_str(&format!("(func $destruct{} (param $tmp i32)\n", id));
                 let mut instrs = Vec::new();
                 let elem_size = Wasm32Backend::type_size(ty);
                 for i in 0..*length {
                     if ty.wasm_is_allocated() {
-                        instrs.push(Instr::LocalGet(TMP_VAR_ID));
+                        instrs.push(Instr::TmpGet);
                         instrs.push(Instr::I32Const((i as u32 * elem_size) as i32));
                         instrs.push(Instr::I32Add);
                         instrs.push(ty.wasm_load());
                         instrs.push(Instr::Destruct(ty));
                     }
                 }
-                instrs.push(Instr::LocalGet(TMP_VAR_ID));
+                instrs.push(Instr::TmpGet);
                 instrs.push(Instr::Dealloc);
                 wat.push_str(")\n");
                 wat.push_str(&format!(
-                    "(func $eq{} (param $var1 i32) (param $var2 i32) (result i32)\n",
+                    "(func $eq{} (param i32) (param i32) (result i32)\n",
                     id
                 ));
                 let mut instrs = Vec::new();
                 // check if they're the same pointer
-                instrs.push(Instr::LocalGet(1)); // var1
-                instrs.push(Instr::LocalGet(2)); // var2
+                instrs.push(Instr::LocalGet(0)); // var1
+                instrs.push(Instr::LocalGet(1)); // var2
                 instrs.push(Instr::I32Eq);
                 instrs.push(Instr::If(&IrType::Unit));
                 instrs.push(Instr::I32Const(1));
@@ -524,11 +918,11 @@ impl IrType {
                         offset += Wasm32Backend::type_size(ty);
                         continue;
                     }
-                    instrs.push(Instr::LocalGet(1)); // var1
+                    instrs.push(Instr::LocalGet(0)); // var1
                     instrs.push(Instr::I32Const(offset as i32));
                     instrs.push(Instr::I32Add);
                     instrs.push(ty.wasm_load());
-                    instrs.push(Instr::LocalGet(2)); // var2
+                    instrs.push(Instr::LocalGet(1)); // var2
                     instrs.push(Instr::I32Const(offset as i32));
                     instrs.push(Instr::I32Add);
                     instrs.push(ty.wasm_load());
@@ -570,7 +964,13 @@ impl IrType {
                                 IrType::Optional { .. } => {
                                     unimplemented!("Nested optionals not supported");
                                 },
+                                IrType::Range { .. } => {
+                                    instrs.push(Instr::RangeEq(ty));
+                                },
                             }
+                        },
+                        IrType::Range { .. } => {
+                            instrs.push(Instr::RangeEq(ty));
                         },
                     }
                     instrs.push(Instr::If(&IrType::Unit));
@@ -591,10 +991,7 @@ impl IrType {
             },
             IrType::Optional { id, ty, .. } => {
                 if ty.wasm_is_allocated() {
-                    wat.push_str(&format!(
-                        "(func $destruct{} (param $var{} i32)\n",
-                        id, TMP_VAR_ID
-                    ));
+                    wat.push_str(&format!("(func $destruct{id} (param $tmp i32)\n"));
                     let mut instrs = Vec::new();
                     match ty {
                         IrType::F64 => {
@@ -613,13 +1010,18 @@ impl IrType {
                         | IrType::Array { .. }
                         | IrType::Ref { .. }
                         | IrType::Fn { .. } => {
-                            instrs.push(Instr::LocalGet(TMP_VAR_ID));
+                            instrs.push(Instr::TmpGet);
                             instrs.extend(Expr::Literal(Literal::Nil { ty }).compile_wasm());
                             instrs.push(Instr::I32Ne);
                         },
+                        IrType::Range { .. } => {
+                            instrs.push(Instr::TmpGet);
+                            instrs.extend(Expr::Literal(Literal::Nil { ty }).compile_wasm());
+                            instrs.push(Instr::RangeNe(ty));
+                        },
                     }
                     instrs.push(Instr::If(&IrType::Unit));
-                    instrs.push(Instr::LocalGet(TMP_VAR_ID));
+                    instrs.push(Instr::TmpGet);
                     instrs.push(Instr::Destruct(ty));
                     instrs.push(Instr::End);
                     wat.push_str(
@@ -631,20 +1033,20 @@ impl IrType {
                     );
                     wat.push_str(")\n");
                     wat.push_str(&format!(
-                        "(func $eq{} (param $var1 i32) (param $var2 i32) (result i32)\n",
+                        "(func $eq{} (param i32) (param i32) (result i32)\n",
                         id
                     ));
                     let mut instrs = Vec::new();
                     // check if they're the same pointer
-                    instrs.push(Instr::LocalGet(1)); // var1
-                    instrs.push(Instr::LocalGet(2)); // var2
+                    instrs.push(Instr::LocalGet(0)); // var1
+                    instrs.push(Instr::LocalGet(1)); // var2
                     instrs.push(Instr::I32Eq);
                     instrs.push(Instr::If(&IrType::Unit));
                     instrs.push(Instr::I32Const(1));
                     instrs.push(Instr::Return);
                     instrs.push(Instr::End);
                     // if either is nil, return false
-                    instrs.push(Instr::LocalGet(1)); // var1
+                    instrs.push(Instr::LocalGet(0)); // var1
                     instrs.extend(Expr::Literal(Literal::Nil { ty }).compile_wasm());
                     match ty {
                         IrType::F64 => {
@@ -664,13 +1066,16 @@ impl IrType {
                         | IrType::Ref { .. }
                         | IrType::Fn { .. } => {
                             instrs.push(Instr::I32Eq);
+                        },
+                        IrType::Range { .. } => {
+                            instrs.push(Instr::RangeEq(ty));
                         },
                     }
                     instrs.push(Instr::If(&IrType::Unit));
                     instrs.push(Instr::I32Const(0));
                     instrs.push(Instr::Return);
                     instrs.push(Instr::End);
-                    instrs.push(Instr::LocalGet(2)); // var2
+                    instrs.push(Instr::LocalGet(1)); // var2
                     instrs.extend(Expr::Literal(Literal::Nil { ty }).compile_wasm());
                     match ty {
                         IrType::F64 => {
@@ -690,6 +1095,9 @@ impl IrType {
                         | IrType::Ref { .. }
                         | IrType::Fn { .. } => {
                             instrs.push(Instr::I32Eq);
+                        },
+                        IrType::Range { .. } => {
+                            instrs.push(Instr::RangeEq(ty));
                         },
                     }
                     instrs.push(Instr::If(&IrType::Unit));
@@ -697,8 +1105,8 @@ impl IrType {
                     instrs.push(Instr::Return);
                     instrs.push(Instr::End);
                     // compare the inner values
-                    instrs.push(Instr::LocalGet(1)); // var1
-                    instrs.push(Instr::LocalGet(2)); // var2
+                    instrs.push(Instr::LocalGet(0)); // var1
+                    instrs.push(Instr::LocalGet(1)); // var2
                     instrs.push(Instr::TypeEq(ty));
                     wat.push_str(
                         instrs
@@ -719,36 +1127,25 @@ impl IrType {
 pub struct Wasm32Backend;
 
 pub struct WasmFn {
-    id:     u64,
-    params: Vec<&'static IrValue>,
-    ret_ty: Option<&'static IrType>,
+    id:         u64,
+    ret_ty:     Option<&'static IrType>,
     // need to push an i32 tmp local with the name $var_1
-    locals: Vec<&'static IrValue>,
-    body:   Vec<Instr>,
+    body:       Vec<Instr>,
+    stack_size: u32,
 }
 
 impl WasmFn {
     pub fn to_wat(&self) -> String {
         let mut wat = String::new();
-        wat.push_str(&format!("(func $fn{} ", self.id));
-        for param in &self.params {
-            wat.push_str(&format!(
-                "(param $var{} {}) ",
-                param.id(),
-                param.ty().to_wat()
-            ));
-        }
+        wat.push_str(&format!("(func $fn{} (param $sp i32)", self.id));
         if let Some(ret_ty) = &self.ret_ty {
             wat.push_str(&format!("(result {}) ", ret_ty.to_wat()));
         }
-        wat.push_str("(local $var1 i32) "); // tmp local
-        for local in &self.locals {
-            wat.push_str(&format!(
-                "(local $var{} {}) ",
-                local.id(),
-                local.ty().to_wat()
-            ));
-        }
+        wat.push_str("(local $tmp i32)\n"); // tmp local
+        wat.push_str(&format!(
+            "(local.get $sp)\n(i32.const {})\n(i32.sub)\n(local.set $sp)\n",
+            self.stack_size
+        ));
         wat.push('\n');
         for instr in &self.body {
             wat.push_str(&format!("  {}\n", instr.to_wat()));
@@ -769,16 +1166,31 @@ impl Wasm32Backend {
                 locals,
                 ..
             } => {
+                let mut stack_size: u32 = 0;
+                for param in params {
+                    stack_size += Self::type_size(param.ty());
+                }
+                for local in locals {
+                    stack_size += Self::type_size(local.ty());
+                }
+                let mut offset = stack_size;
+                for param in params {
+                    offset -= Self::type_size(param.ty());
+                    param.set_offset(offset as u64);
+                }
+                for local in locals {
+                    offset -= Self::type_size(local.ty());
+                    local.set_offset(offset as u64);
+                }
                 WasmFn {
-                    id:     *id,
-                    params: params.to_vec(),
+                    id: *id,
                     ret_ty: if ret_ty.is_valued() {
                         Some(ret_ty)
                     } else {
                         None
                     },
-                    locals: locals.to_vec(),
-                    body:   body.compile_wasm(),
+                    body: body.compile_wasm(),
+                    stack_size,
                 }
             },
             _ => unimplemented!("WASM compilation not implemented for {:?}", func),
@@ -803,6 +1215,12 @@ impl Wasm32Backend {
             IrType::Ref { .. } => 4, // pointer
             IrType::Fn { .. } => 4,  // function pointer
             IrType::Optional { ty, .. } => Self::type_size(ty),
+            IrType::Range {
+                start,
+                end,
+                inclusive,
+                ..
+            } => words(*start, *end, *inclusive) * 4,
         }
     }
 
@@ -851,12 +1269,11 @@ impl Block {
                         }
                     }
                 },
-                Stmt::Let { ty, value, expr } => {
+                Stmt::Let { value, expr, .. } => {
                     if let Some(expr) = expr {
-                        instrs.extend(expr.compile_wasm());
-                        if ty.is_valued() {
-                            // if ty is unit or never, then we can't store it because it won't exist
-                            instrs.push(Instr::LocalSet(value.id()));
+                        instrs.push(Instr::VarSet(value, expr.compile_wasm()));
+                        if expr.ty().wasm_is_scratch() {
+                            instrs.push(Instr::ScDealloc(Wasm32Backend::type_size(expr.ty())));
                         }
                     }
                 },
@@ -872,17 +1289,18 @@ impl Block {
                     if expr.ty().is_valued() {
                         if expr.ty().wasm_is_allocated() {
                             instrs.push(Instr::Destruct(expr.ty()));
+                        } else if expr.ty().wasm_is_scratch() {
+                            instrs.push(Instr::ScDealloc(Wasm32Backend::type_size(expr.ty())));
                         } else {
                             instrs.push(Instr::Drop);
                         }
                     }
                 },
-                Stmt::Let { ty, value, expr } => {
+                Stmt::Let { value, expr, .. } => {
                     if let Some(expr) = expr {
-                        instrs.extend(expr.compile_wasm());
-                        if ty.is_valued() {
-                            // if ty is unit or never, then we can't store it because it won't exist
-                            instrs.push(Instr::LocalSet(value.id()));
+                        instrs.push(Instr::VarSet(value, expr.compile_wasm()));
+                        if expr.ty().wasm_is_scratch() {
+                            instrs.push(Instr::ScDealloc(Wasm32Backend::type_size(expr.ty())));
                         }
                     }
                 },
@@ -933,6 +1351,62 @@ impl Expr {
                             IrType::Optional { .. } => {
                                 unimplemented!("Nested optionals not supported");
                             },
+                            IrType::Range {
+                                start,
+                                end,
+                                inclusive,
+                                ..
+                            } => {
+                                let words = words(*start, *end, *inclusive);
+                                if words == 1 {
+                                    instrs.push(Instr::I32Const(i32::MIN));
+                                } else {
+                                    let total_size = words * 4;
+                                    instrs.push(Instr::ScAlloc(total_size));
+                                    instrs.push(Instr::TmpTee);
+                                    // for nil, we use the min value, so every word is 0 except the
+                                    // last with is i32::MIN
+                                    for i in 0..words {
+                                        instrs.push(Instr::TmpGet);
+                                        if i == words - 1 {
+                                            instrs.push(Instr::I32Const(0));
+                                        } else {
+                                            instrs.push(Instr::I32Const(i32::MIN));
+                                        }
+                                    }
+                                }
+                            },
+                        }
+                    },
+                    Literal::Range { val, ty } => {
+                        let words = match ty {
+                            IrType::Range {
+                                start,
+                                end,
+                                inclusive,
+                                ..
+                            } => words(*start, *end, *inclusive),
+                            _ => panic!("Expected range type"),
+                        };
+                        if words > 1 {
+                            // allocate memory for the range
+                            let total_size = words * 4;
+                            instrs.push(Instr::ScAlloc(total_size));
+                            instrs.push(Instr::TmpTee);
+                            for i in 0..words {
+                                instrs.push(Instr::TmpGet);
+                                if i > 0 {
+                                    instrs.push(Instr::I32Const((i * 4) as i32));
+                                    instrs.push(Instr::I32Add);
+                                }
+                                instrs.push(Instr::I32Const(
+                                    ((val >> (i * 32)) & 0xFFFFFFFFi128) as i32,
+                                ));
+                                instrs.push(Instr::I32Store);
+                            }
+                        } else {
+                            // single word range, just push the word
+                            instrs.push(Instr::I32Const(*val as i32));
                         }
                     },
                 }
@@ -945,8 +1419,8 @@ impl Expr {
                             value
                         );
                     },
-                    IrValue::Var { id, .. } => {
-                        instrs.push(Instr::LocalGet(*id));
+                    v @ IrValue::Var { .. } => {
+                        instrs.push(Instr::VarGet(v));
                     },
                     IrValue::Fn { idx, .. } => {
                         instrs.push(Instr::I32Const(*idx as i32));
@@ -958,11 +1432,11 @@ impl Expr {
             },
             Expr::Tuple { expr, ty, .. } => {
                 instrs.push(Instr::Alloc(Wasm32Backend::type_size(ty)));
-                instrs.push(Instr::LocalTee(TMP_VAR_ID));
+                instrs.push(Instr::TmpTee);
                 let mut offset = 0;
                 for e in expr {
                     if e.ty().is_valued() {
-                        instrs.push(Instr::LocalGet(TMP_VAR_ID));
+                        instrs.push(Instr::TmpGet);
                         instrs.push(Instr::I32Const(offset as i32));
                         instrs.push(Instr::I32Add);
                         instrs.extend(e.compile_wasm());
@@ -980,9 +1454,9 @@ impl Expr {
                     let elem_size = Wasm32Backend::type_size(elem_ty);
                     let total_size = elem_size * (elems.len() as u32);
                     instrs.push(Instr::Alloc(total_size));
-                    instrs.push(Instr::LocalTee(TMP_VAR_ID));
+                    instrs.push(Instr::TmpTee);
                     for (i, e) in elems.iter().enumerate() {
-                        instrs.push(Instr::LocalGet(TMP_VAR_ID));
+                        instrs.push(Instr::TmpGet);
                         instrs.push(Instr::I32Const((i as u32 * elem_size) as i32));
                         instrs.push(Instr::I32Add);
                         instrs.extend(e.compile_wasm());
@@ -995,7 +1469,7 @@ impl Expr {
                     StructExpr::Named { fields, rest, ty } => {
                         let struct_size = Wasm32Backend::type_size(ty);
                         instrs.push(Instr::Alloc(struct_size));
-                        instrs.push(Instr::LocalTee(TMP_VAR_ID));
+                        instrs.push(Instr::TmpTee);
                         let field_defs = match &ty {
                             IrType::Struct { fields, .. } => {
                                 match fields {
@@ -1013,7 +1487,7 @@ impl Expr {
                             // if there is no field in the expr, assign it to
                             // nil
                             let field_expr = fields.iter().find(|x| x.name == field.name);
-                            instrs.push(Instr::LocalGet(TMP_VAR_ID));
+                            instrs.push(Instr::TmpGet);
                             instrs.push(Instr::I32Const(offset as i32));
                             offset += Wasm32Backend::type_size(field.ty);
                             instrs.push(Instr::I32Add);
@@ -1086,7 +1560,7 @@ impl Expr {
             } => {
                 if let Some(idx_expr) = idx {
                     // array index assignment
-                    instrs.push(Instr::LocalGet(value.id()));
+                    instrs.push(Instr::VarGet(value));
                     let arr_ty = match field {
                         Some(field_name) => {
                             // struct field which is an array
@@ -1146,10 +1620,10 @@ impl Expr {
                     if elem_ty.wasm_is_allocated() {
                         // if this is an allocated type, we need to run expr,
                         // then destruct, then store
-                        instrs.push(Instr::LocalTee(TMP_VAR_ID));
+                        instrs.push(Instr::TmpTee);
                         instrs.extend(expr.compile_wasm());
                         // now we have our stack ready to store, but first we need
-                        instrs.push(Instr::LocalGet(TMP_VAR_ID));
+                        instrs.push(Instr::TmpGet);
                         instrs.push(elem_ty.wasm_load());
                         instrs.push(Instr::Destruct(elem_ty));
                         // now, our stack is ready to store again
@@ -1162,7 +1636,7 @@ impl Expr {
                 } else if expr.ty().is_valued() {
                     if let Some(field) = field {
                         // struct field assignment
-                        instrs.push(Instr::LocalGet(value.id()));
+                        instrs.push(Instr::VarGet(value));
                         instrs.push(Instr::I32Const(
                             Wasm32Backend::field_offset(value.ty(), field) as i32,
                         ));
@@ -1171,19 +1645,47 @@ impl Expr {
                             && expr.ty().wasm_is_allocated()
                             && !partially_moved.contains(field)
                         {
+                            let field_ty = match value.ty() {
+                                IrType::Struct { fields, .. } => {
+                                    match fields {
+                                        StructFields::Named { fields } => {
+                                            let field_def = fields
+                                                .iter()
+                                                .find(|x| &x.name == field)
+                                                .expect("Field not found in struct");
+                                            field_def.ty
+                                        },
+                                    }
+                                },
+                                IrType::Ref {
+                                    ty: IrType::Struct { fields, .. },
+                                    ..
+                                } => {
+                                    match fields {
+                                        StructFields::Named { fields } => {
+                                            let field_def = fields
+                                                .iter()
+                                                .find(|x| &x.name == field)
+                                                .expect("Field not found in struct");
+                                            field_def.ty
+                                        },
+                                    }
+                                },
+                                _ => panic!("Expected struct type"),
+                            };
                             // not partially moved, so we need to call the destructor
-                            instrs.push(Instr::LocalTee(TMP_VAR_ID));
-                            instrs.push(expr.ty().wasm_load());
-                            instrs.push(Instr::Destruct(expr.ty()));
-                            instrs.push(Instr::LocalGet(TMP_VAR_ID));
+                            instrs.push(Instr::TmpTee);
+                            instrs.push(field_ty.wasm_load());
+                            instrs.push(Instr::Destruct(field_ty));
+                            instrs.push(Instr::TmpGet);
                         }
                         instrs.extend(expr.compile_wasm());
                         instrs.push(expr.ty().wasm_store());
                     } else {
                         // simple variable assignment
-                        instrs.extend(expr.compile_wasm());
+                        let mut ins = expr.compile_wasm();
                         if !moved && expr.ty().wasm_is_allocated() {
-                            instrs.extend(
+                            ins.extend(
                                 Expr::Free {
                                     expr:   Box::new(Expr::Literal(Literal::Unit)),
                                     values: vec![(value, partially_moved.clone())],
@@ -1191,10 +1693,13 @@ impl Expr {
                                 .compile_wasm(),
                             );
                         }
-                        instrs.push(Instr::LocalSet(value.id()));
+                        instrs.push(Instr::VarSet(value, ins));
                     }
                 } else {
                     instrs.extend(expr.compile_wasm());
+                }
+                if expr.ty().wasm_is_scratch() {
+                    instrs.push(Instr::ScDealloc(Wasm32Backend::type_size(expr.ty())));
                 }
             },
             Expr::BinaryOp {
@@ -1270,10 +1775,16 @@ impl Expr {
                                     IrType::Optional { .. } => {
                                         unimplemented!("Nested optionals not supported");
                                     },
+                                    IrType::Range { .. } => {
+                                        instrs.push(Instr::RangeEq(ty));
+                                    },
                                 }
                             },
                             IrType::Struct { .. } | IrType::Tuple { .. } | IrType::Array { .. } => {
                                 instrs.push(Instr::TypeEq(ty));
+                            },
+                            IrType::Range { .. } => {
+                                instrs.push(Instr::RangeEq(ty));
                             },
                         }
                     },
@@ -1319,13 +1830,46 @@ impl Expr {
                                     IrType::Optional { .. } => {
                                         unimplemented!("Nested optionals not supported");
                                     },
+                                    IrType::Range { .. } => {
+                                        instrs.push(Instr::RangeNe(ty));
+                                    },
                                 }
                             },
                             IrType::Struct { .. } | IrType::Tuple { .. } | IrType::Array { .. } => {
                                 instrs.push(Instr::TypeEq(ty));
                                 instrs.push(Instr::I32Eqz);
                             },
+                            IrType::Range { .. } => {
+                                instrs.push(Instr::RangeNe(ty));
+                            },
                         }
+                    },
+                    (BinaryOp::Add, ty @ IrType::Range { .. }) => {
+                        instrs.push(Instr::RangeAdd(ty));
+                    },
+                    (BinaryOp::Sub, ty @ IrType::Range { .. }) => {
+                        instrs.push(Instr::RangeSub(ty));
+                    },
+                    (BinaryOp::Mul, ty @ IrType::Range { .. }) => {
+                        instrs.push(Instr::RangeMul(ty));
+                    },
+                    (BinaryOp::Div, ty @ IrType::Range { .. }) => {
+                        instrs.push(Instr::RangeDiv(ty));
+                    },
+                    (BinaryOp::Mod, ty @ IrType::Range { .. }) => {
+                        instrs.push(Instr::RangeMod(ty));
+                    },
+                    (BinaryOp::Lt, IrType::Range { .. }) => {
+                        instrs.push(Instr::RangeLt(left.ty()));
+                    },
+                    (BinaryOp::Leq, IrType::Range { .. }) => {
+                        instrs.push(Instr::RangeLe(left.ty()));
+                    },
+                    (BinaryOp::Gt, IrType::Range { .. }) => {
+                        instrs.push(Instr::RangeGt(left.ty()));
+                    },
+                    (BinaryOp::Geq, IrType::Range { .. }) => {
+                        instrs.push(Instr::RangeGe(left.ty()));
                     },
 
                     _ => {
@@ -1349,6 +1893,9 @@ impl Expr {
                         instrs.extend(expr.compile_wasm());
                         instrs.push(Instr::F64Sub);
                     },
+                    (UnaryOp::Neg, IrType::Range { .. }) => {
+                        instrs.push(Instr::RangeNeg(ty, expr.compile_wasm()));
+                    },
                     (UnaryOp::Not, IrType::Bool) => {
                         instrs.extend(expr.compile_wasm());
                         instrs.push(Instr::I32Eqz);
@@ -1357,6 +1904,10 @@ impl Expr {
                         instrs.extend(expr.compile_wasm());
                         instrs.push(Instr::I32Const(-1));
                         instrs.push(Instr::I32Xor);
+                    },
+                    (UnaryOp::Not, IrType::Range { .. }) => {
+                        instrs.extend(expr.compile_wasm());
+                        instrs.push(Instr::RangeNot(ty));
                     },
                     (UnaryOp::Ref, IrType::Struct { .. })
                     | (UnaryOp::Ref, IrType::Tuple { .. }) => {
@@ -1389,13 +1940,19 @@ impl Expr {
                     | IrType::Array { .. }
                     | IrType::Ref { .. }
                     | IrType::Fn { .. } => {
-                        instrs.push(Instr::LocalTee(TMP_VAR_ID));
-                        instrs.push(Instr::LocalGet(TMP_VAR_ID));
+                        instrs.push(Instr::TmpTee);
+                        instrs.push(Instr::TmpGet);
                         instrs.extend(Expr::Literal(Literal::Nil { ty }).compile_wasm());
                         instrs.push(Instr::I32Eq);
                     },
                     IrType::Optional { .. } => {
                         unimplemented!("Nested optionals not supported");
+                    },
+                    IrType::Range { .. } => {
+                        instrs.push(Instr::TmpTee);
+                        instrs.push(Instr::TmpGet);
+                        instrs.extend(Expr::Literal(Literal::Nil { ty }).compile_wasm());
+                        instrs.push(Instr::RangeEq(ty));
                     },
                 }
                 instrs.push(Instr::If(&IrType::Unit));
@@ -1406,8 +1963,37 @@ impl Expr {
                 instrs.extend(expr.compile_wasm());
             },
             Expr::Call { func, args, .. } => {
+                let mut offset = 0;
                 for arg in args {
-                    instrs.extend(arg.compile_wasm());
+                    offset += Wasm32Backend::type_size(arg.ty());
+                    instrs.push(Instr::StackSet(arg.ty(), offset, arg.compile_wasm()));
+                    if arg.ty().wasm_is_scratch() {
+                        instrs.push(Instr::ScDealloc(Wasm32Backend::type_size(arg.ty())));
+                    }
+                }
+                instrs.push(Instr::SpGet);
+                if let IrType::Fn { param_tys, .. } = func.ty() {
+                    if !param_tys.is_empty() {
+                        if let IrType::Range { universe: true, .. } = param_tys[0] {
+                            // if we have a universe range as the first parameter, we need to
+                            // append the number of words used to represent the range
+                            let words = match args[0].ty() {
+                                IrType::Range {
+                                    start,
+                                    end,
+                                    inclusive,
+                                    ..
+                                } => words(*start, *end, *inclusive),
+                                IrType::I32 => 1,
+                                _ => {
+                                    panic!(
+                                        "Expected range or i32 type for universe range parameter"
+                                    )
+                                },
+                            };
+                            instrs.push(Instr::I32Const(words as i32));
+                        }
+                    }
                 }
                 instrs.extend(func.compile_wasm());
                 instrs.push(Instr::CallIndirect(func.ty()));
@@ -1423,6 +2009,18 @@ impl Expr {
             Expr::Index { expr, index, ty } => {
                 instrs.extend(expr.compile_wasm());
                 instrs.extend(index.compile_wasm());
+                // range check
+                if let IrType::Array { length, .. } = expr.ty() {
+                    instrs.push(Instr::TmpTee);
+                    instrs.push(Instr::I32Const(*length as i32));
+                    instrs.push(Instr::I32GeU);
+                    instrs.push(Instr::If(&IrType::Unit));
+                    instrs.push(Instr::Unreachable);
+                    instrs.push(Instr::End);
+                    instrs.push(Instr::TmpGet);
+                } else {
+                    panic!("Expected array type for indexing");
+                }
                 let elem_size = match expr.ty() {
                     IrType::Array { ty, .. } => Wasm32Backend::type_size(ty),
                     _ => panic!("Expected array type"),
@@ -1440,7 +2038,7 @@ impl Expr {
                 for (value, partially_moved) in values.iter().rev() {
                     if value.ty().wasm_is_allocated() {
                         if partially_moved.is_empty() {
-                            instrs.push(Instr::LocalGet(value.id()));
+                            instrs.push(Instr::VarGet(value));
                             instrs.push(Instr::Destruct(value.ty()));
                         } else {
                             match value.ty() {
@@ -1454,7 +2052,7 @@ impl Expr {
                                         {
                                             continue;
                                         }
-                                        instrs.push(Instr::LocalGet(value.id()));
+                                        instrs.push(Instr::VarGet(value));
                                         instrs.push(Instr::I32Const(Wasm32Backend::field_offset(
                                             value.ty(),
                                             &field.name,
@@ -1465,7 +2063,7 @@ impl Expr {
                                         instrs.push(Instr::Destruct(field.ty));
                                     }
                                     // we need to manually deallocate the struct itself
-                                    instrs.push(Instr::LocalGet(value.id()));
+                                    instrs.push(Instr::VarGet(value));
                                     instrs.push(Instr::Dealloc);
                                 },
                                 _ => {
@@ -1512,4 +2110,99 @@ impl If {
         instrs.push(Instr::Close);
         instrs
     }
+}
+
+// the number of 32 bit words needed to represent the given integer
+fn words(mut start: i128, end: i128, inclusive: bool) -> u32 {
+    start = start.saturating_sub(1);
+    words_to_represent(start).max(words_to_represent(if inclusive { end } else { end - 1 }))
+}
+
+fn words_to_represent(num: i128) -> u32 {
+    if num == 0 {
+        1
+    } else if num > 0 {
+        if num < (1i128 << 31) {
+            1
+        } else if num < (1i128 << 63) {
+            2
+        } else if num < (1i128 << 95) {
+            3
+        } else {
+            4
+        }
+    } else {
+        // negative number
+        if num >= -(1i128 << 31) {
+            1
+        } else if num >= -(1i128 << 63) {
+            2
+        } else if num >= -(1i128 << 95) {
+            3
+        } else {
+            4
+        }
+    }
+}
+
+fn range_checks(ty: &'static IrType) -> Vec<Instr> {
+    let IrType::Range {
+        start,
+        end,
+        inclusive,
+        ..
+    } = ty
+    else {
+        panic!("Expected range type");
+    };
+    let words = words(*start, *end, *inclusive);
+    let mut instrs = Vec::new();
+    instrs.push(Instr::TmpTee);
+    if words == 1 {
+        instrs.push(Instr::TmpGet);
+        if *start != 0 {
+            instrs.push(Instr::I32Const(*start as i32));
+            instrs.push(Instr::I32Sub);
+        }
+        instrs.push(Instr::I32Const((end - start) as i32));
+        instrs.push(if *inclusive {
+            Instr::I32GtU
+        } else {
+            Instr::I32GeU
+        });
+        instrs.push(Instr::If(&IrType::Unit));
+        instrs.push(Instr::Unreachable);
+        instrs.push(Instr::End);
+    } else {
+        instrs.push(Instr::Comment("TEST"));
+        instrs.push(Instr::TmpGet);
+        instrs.extend(Expr::Literal(Literal::Range { val: *start, ty }).compile_wasm());
+        instrs.push(Instr::RangeLt(ty));
+        instrs.push(Instr::If(&IrType::Unit));
+        instrs.push(Instr::Unreachable);
+        instrs.push(Instr::End);
+        // the range cmp functions deallocate both words, we want to keep the first
+        // though since this is a range check not a typical comparison
+        instrs.push(Instr::ScAlloc(4 * words));
+        instrs.push(Instr::Drop);
+        // $tmp is now the value of start, but we have our left on the stack, we so we
+        // can tee again
+        instrs.push(Instr::TmpTee);
+        instrs.push(Instr::TmpGet);
+        instrs.extend(Expr::Literal(Literal::Range { val: *end, ty }).compile_wasm());
+        if *inclusive {
+            instrs.push(Instr::RangeGt(ty));
+        } else {
+            instrs.push(Instr::RangeGe(ty));
+        }
+        instrs.push(Instr::TmpTee);
+        instrs.push(Instr::If(&IrType::Unit));
+        instrs.push(Instr::Unreachable);
+        instrs.push(Instr::End);
+        // the range cmp functions deallocate both words, we want to keep the first
+        // though since this is a range check not a typical comparison
+        instrs.push(Instr::ScAlloc(4 * words));
+        instrs.push(Instr::Drop);
+    }
+    instrs
 }

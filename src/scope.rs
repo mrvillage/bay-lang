@@ -19,10 +19,12 @@ use crate::{
 // scope but not values (except for consts)
 
 pub struct Scope {
-    pub id:           u64,
-    pub type_parent:  Option<&'static Scope>,
-    pub type_ns:      Option<DashMap<&'static str, &'static Type>>, /* this also includes
-                                                                     * modules */
+    pub id: u64,
+    pub type_parent: Option<&'static Scope>,
+    // this also includes modules
+    pub type_ns: Option<DashMap<&'static str, &'static Type>>,
+    pub unresolved_aliases: Option<DashMap<&'static str, concrete::ConcreteType>>,
+
     pub value_parent: Option<&'static Scope>,
     pub value_ns:     Option<DashMap<&'static str, &'static Value>>,
     pub includes:     Vec<&'static Scope>, /* also includes these scopes, this is for `use`
@@ -41,7 +43,7 @@ impl std::fmt::Debug for Scope {
             // .field("type_parent", &self.type_parent.as_ref().map(|s| s.id))
             // .field("type_ns", &self.type_ns.as_ref().map(|ns| ns.len()))
             // .field("value_parent", &self.value_parent.as_ref().map(|s| s.id))
-            // .field("value_ns", &self.value_ns.as_ref().map(|ns| ns.len()))
+            .field("value_ns", &self.value_ns)
             // .field(
             //     "includes",
             //     &self.includes.iter().map(|s| s.id).collect::<Vec<_>>(),
@@ -70,16 +72,17 @@ impl InitStore for Scope {
         type_ns.insert("f64", Type::get_by_id(F64_TYPE_ID).unwrap());
         type_ns.insert("bool", Type::get_by_id(BOOL_TYPE_ID).unwrap());
         let root_scope = Scope {
-            id:           0,
-            type_parent:  None,
-            type_ns:      Some(type_ns),
+            id: 0,
+            type_parent: None,
+            type_ns: Some(type_ns),
+            unresolved_aliases: None,
             value_parent: None,
-            value_ns:     None,
-            includes:     Vec::new(),
+            value_ns: None,
+            includes: Vec::new(),
             module_scope: None,
-            use_items:    Vec::new(),
-            return_ty:    None,
-            break_ty:     None,
+            use_items: Vec::new(),
+            return_ty: None,
+            break_ty: None,
         };
         store.items.insert(0, root_scope);
         store.next_id.store(1, std::sync::atomic::Ordering::Relaxed);
@@ -157,6 +160,13 @@ pub enum Type {
         ret_ty:     &'static Type,
         scope:      &'static Scope,
     },
+    Range {
+        id:        u64,
+        start:     i128,
+        end:       i128,
+        inclusive: bool,
+        universe:  bool,
+    },
 }
 
 impl std::fmt::Debug for Type {
@@ -233,6 +243,26 @@ impl std::fmt::Debug for Type {
                 }
                 write!(f, "] -> {:?})", ret_ty)
             },
+            Type::Range {
+                id,
+                start,
+                end,
+                inclusive,
+                universe,
+            } => {
+                if *universe {
+                    write!(f, "UniverseRange({})", id)
+                } else {
+                    write!(
+                        f,
+                        "Range({}, {}..{}{})",
+                        id,
+                        start,
+                        if *inclusive { "=" } else { "" },
+                        end,
+                    )
+                }
+            },
         }
     }
 }
@@ -274,6 +304,7 @@ impl PartialEq for Type {
                     ..
                 },
             ) => p1 == p2 && r1 == r2,
+            (Type::Range { id: id1, .. }, Type::Range { id: id2, .. }) => id1 == id2,
             _ => false,
         }
     }
@@ -335,6 +366,9 @@ impl std::hash::Hash for Type {
                 param_tys.hash(state);
                 ret_ty.hash(state);
             },
+            Type::Range { id, .. } => {
+                id.hash(state);
+            },
         }
     }
 }
@@ -360,7 +394,6 @@ impl InitStore for Type {
 
 pub static mut VALUE_STORE: Option<Store<Value>> = None;
 
-#[derive(Debug)]
 pub enum Value {
     Const {
         id:         u64,
@@ -390,6 +423,52 @@ pub enum Value {
         body:       Box<hir::Block>,
         ty:         MaybeType,
     },
+}
+
+impl std::fmt::Debug for Value {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Value::Const { id, name, ty, .. } => {
+                write!(f, "Const({}, {}, {:?})", id, name.value, ty)
+            },
+            Value::Var {
+                id,
+                name,
+                ty,
+                moved,
+                partially_moved,
+            } => {
+                write!(
+                    f,
+                    "Var({}, {}, {:?}, moved: {}, partially_moved: {:?})",
+                    id,
+                    name.value,
+                    ty,
+                    moved,
+                    partially_moved
+                        .iter()
+                        .map(|id| &id.value)
+                        .collect::<Vec<_>>()
+                )
+            },
+            Value::Fn {
+                id,
+                name,
+                ret_ty,
+                params,
+                ..
+            } => {
+                write!(f, "Fn({}, {}, {:?}, params: [", id, name.value, ret_ty)?;
+                for (i, (param_name, param_ty, _)) in params.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "{}: {:?}", param_name.value, param_ty)?;
+                }
+                write!(f, "])")
+            },
+        }
+    }
 }
 
 impl std::hash::Hash for Value {
@@ -485,6 +564,7 @@ impl Value {
 }
 
 pub const PRINT_I32_VALUE_ID: u64 = 1;
+pub const PRINT_WORDS_VALUE_ID: u64 = 2;
 pub const FIRST_NON_RESERVED_VALUE_ID: u64 = 5;
 
 impl InitStore for Value {
@@ -510,6 +590,7 @@ pub fn create_scope(
             id,
             type_parent: Some(type_parent),
             type_ns: None,
+            unresolved_aliases: None,
             value_parent: Some(value_parent),
             value_ns: None,
             includes: Vec::new(),
@@ -576,6 +657,7 @@ impl Scope {
                 Type::I32 | Type::F64 | Type::Bool | Type::Never | Type::Unit => {
                     // primitive types already have ids
                 },
+                Type::Range { id: ty_id, .. } => *ty_id = id,
             }
             type_store.items.insert(id, ty);
             let ty_ref = Type::get_by_id(id).unwrap();
@@ -592,6 +674,36 @@ impl Scope {
         }
     }
 
+    pub fn new_alias(&self, name: token::Ident, ty: concrete::ConcreteType) -> Result<()> {
+        unsafe {
+            let store = SCOPE_STORE.as_ref().unwrap();
+            let mut scope = store.items.get_mut(&self.id).unwrap();
+            if scope.unresolved_aliases.is_none() {
+                scope.unresolved_aliases = Some(DashMap::new());
+            }
+            if scope
+                .unresolved_aliases
+                .as_ref()
+                .unwrap()
+                .contains_key(name.value)
+            {
+                return Err(CompileError::Error(
+                    name.span,
+                    format!(
+                        "type alias `{}` is already defined in this scope",
+                        name.value
+                    ),
+                ));
+            }
+            scope
+                .unresolved_aliases
+                .as_ref()
+                .unwrap()
+                .insert(name.value, ty);
+            Ok(())
+        }
+    }
+
     pub fn new_value(&self, name: token::Ident, mut val: Value) -> Result<&'static Value> {
         unsafe {
             let store = SCOPE_STORE.as_ref().unwrap();
@@ -601,7 +713,7 @@ impl Scope {
             }
             let value_store = VALUE_STORE.as_ref().unwrap();
             let id = if val.id() < FIRST_NON_RESERVED_VALUE_ID && val.id() != 0 {
-                self.id
+                val.id()
             } else {
                 let id = value_store
                     .next_id
@@ -983,6 +1095,7 @@ impl Type {
                 Type::I32 | Type::F64 | Type::Bool | Type::Never | Type::Unit => {
                     // primitive types already have ids
                 },
+                Type::Range { id: ty_id, .. } => *ty_id = id,
             }
             store.items.insert(id, self);
             &*(&*store.items.get(&id).unwrap() as *const Type)
@@ -1036,6 +1149,19 @@ impl Type {
                 s.push_str(&ret_ty.name());
                 s
             },
+            Type::Range {
+                start,
+                end,
+                inclusive,
+                ..
+            } => {
+                format!(
+                    "Range<{}{}{}>",
+                    start,
+                    if *inclusive { "..=" } else { ".." },
+                    end
+                )
+            },
         }
     }
 
@@ -1055,6 +1181,7 @@ impl Type {
             Type::Ref { id, .. } => *id,
             Type::Optional { id, .. } => *id,
             Type::Fn { id, .. } => *id,
+            Type::Range { id, .. } => *id,
         }
     }
 
@@ -1074,7 +1201,8 @@ impl Type {
             | Type::Bool
             | Type::Slice { .. }
             | Type::Ref { .. }
-            | Type::Fn { .. } => true,
+            | Type::Fn { .. }
+            | Type::Range { .. } => true,
             Type::Optional { ty, .. } => ty.is_copy_type(),
             Type::Struct { .. }
             | Type::Enum { .. }
@@ -1131,7 +1259,8 @@ impl Type {
             | Type::Slice { .. }
             | Type::Ref { .. }
             | Type::Optional { .. }
-            | Type::Fn { .. } => {},
+            | Type::Fn { .. }
+            | Type::Range { .. } => {},
         }
         Ok(())
     }
@@ -1151,7 +1280,7 @@ impl Type {
         match op {
             hir::UnaryOp::Neg => {
                 match self {
-                    Type::I32 | Type::F64 => Ok(self),
+                    Type::I32 | Type::F64 | Type::Range { .. } => Ok(self),
                     Type::Ref {
                         ty: Type::I32 | Type::F64,
                         ..
@@ -1166,7 +1295,7 @@ impl Type {
             },
             hir::UnaryOp::Not => {
                 match self {
-                    Type::Bool | Type::I32 => Ok(self),
+                    Type::Bool | Type::I32 | Type::Range { .. } => Ok(self),
                     Type::Ref {
                         ty: Type::Bool | Type::I32,
                         ..
@@ -1207,14 +1336,17 @@ impl Type {
     pub fn unary_op_hint(&'static self, op: &hir::UnaryOp) -> Option<&'static Type> {
         match op {
             hir::UnaryOp::Neg => {
-                if matches!(self, Type::I32 | Type::F64 | Type::Bool) {
+                if matches!(
+                    self,
+                    Type::I32 | Type::F64 | Type::Bool | Type::Range { .. }
+                ) {
                     Some(self)
                 } else {
                     None
                 }
             },
             hir::UnaryOp::Not => {
-                if matches!(self, Type::Bool | Type::I32) {
+                if matches!(self, Type::Bool | Type::I32 | Type::Range { .. }) {
                     Some(self)
                 } else {
                     None
@@ -1251,7 +1383,7 @@ impl Type {
             | hir::BinaryOp::Mod => {
                 if this == other {
                     match this {
-                        Type::I32 | Type::F64 => Ok(this),
+                        Type::I32 | Type::F64 | Type::Range { .. } => Ok(this),
                         _ => {
                             Err(CompileError::Error(
                                 span,
@@ -1391,7 +1523,7 @@ impl Type {
             | hir::BinaryOp::Mul
             | hir::BinaryOp::Div
             | hir::BinaryOp::Mod => {
-                if matches!(self, Type::I32 | Type::F64) {
+                if matches!(self, Type::I32 | Type::F64 | Type::Range { .. }) {
                     Some((self, self))
                 } else {
                     None
@@ -1517,7 +1649,14 @@ impl Type {
                 false
             },
             Type::Module { .. } => false,
+            Type::Range { .. } => false,
         }
+    }
+
+    #[track_caller]
+    pub fn reconcile_expected(&'static self, expected: &mut MaybeType, span: Span) -> Result<bool> {
+        let mut found = MaybeType::Resolved(self);
+        found.reconcile_expected(expected, span)
     }
 }
 
@@ -1569,6 +1708,7 @@ impl MaybeType {
                     concrete::ConcreteType::Slice(_) => "Unresolved Slice",
                     concrete::ConcreteType::Ref(_) => "Unresolved Ref",
                     concrete::ConcreteType::Optional(_) => "Unresolved Optional",
+                    concrete::ConcreteType::Range { .. } => "Unresolved Range",
                 }
                 .to_string()
             },
@@ -1585,8 +1725,9 @@ impl MaybeType {
     }
 
     #[track_caller]
-    pub fn reconcile_type(&mut self, found: &mut MaybeType, span: Span) -> Result<bool> {
-        let expected = self;
+    // reconcile this found type (self) with the expected type
+    pub fn reconcile_expected(&mut self, expected: &mut MaybeType, span: Span) -> Result<bool> {
+        let found = self;
         // if they are both inferred, then we do nothing
         match (expected, found) {
             (MaybeType::Inferred, MaybeType::Inferred) => Ok(false),
@@ -1595,6 +1736,75 @@ impl MaybeType {
                     // never can be any type, so we treat this as a successful reconciliation
                     return Ok(false);
                 }
+                // optional types can implicitly coerce to their inner type
+                if let Type::Optional { ty, .. } = expected {
+                    if ty == found {
+                        return Ok(false);
+                    }
+                }
+                // ranges can coerce to i32 if they fit within i32 bounds
+                if let (
+                    Type::I32,
+                    Type::Range {
+                        start,
+                        end,
+                        inclusive,
+                        ..
+                    },
+                ) = (&expected, &found)
+                {
+                    // an i32 can accept any range that fits within i32 bounds, i32::MIN is
+                    // reserved for nil though, so the start must be greater than that
+                    if *start > i32::MIN as i128 {
+                        if *inclusive {
+                            if *end <= i32::MAX as i128 {
+                                return Ok(false);
+                            }
+                        } else if *end < i32::MAX as i128 {
+                            return Ok(false);
+                        }
+                    }
+                }
+                if let (Type::Range { universe: true, .. }, Type::Range { .. } | Type::I32) =
+                    (&expected, &found)
+                {
+                    // a universe range can accept any range
+                    return Ok(false);
+                }
+                // if let (
+                //     Type::Range {
+                //         start: e_start,
+                //         end: e_end,
+                //         inclusive: e_incl,
+                //         ..
+                //     },
+                //     Type::Range {
+                //         start: f_start,
+                //         end: f_end,
+                //         inclusive: f_incl,
+                //         ..
+                //     },
+                // ) = (&expected, &found)
+                // {
+                //     // ranges can coerce if the expected range is equal to or larger than the
+                // found range
+                //     let start_ok = e_start <= f_start;
+                //     let end_ok = e_end >= f_end;
+                //     let incl_ok = if e_end == f_end {
+                //         // if the ends are equal, then the expected range must be at least as
+                //         // inclusive
+                //         if *e_incl {
+                //             *f_incl
+                //         } else {
+                //             true
+                //         }
+                //     } else {
+                //         true
+                //     };
+                //     if start_ok && end_ok && incl_ok {
+                //         return Ok(false);
+                //     }
+                // }
                 if expected == found {
                     Ok(false)
                 } else {
@@ -1683,6 +1893,21 @@ impl concrete::ConcreteType {
                 }
                 .store())
             },
+            concrete::ConcreteType::Range {
+                start,
+                end,
+                inclusive,
+                ..
+            } => {
+                Ok(Type::Range {
+                    id:        0,
+                    start:     *start,
+                    end:       *end,
+                    inclusive: *inclusive,
+                    universe:  false,
+                }
+                .store())
+            },
         }
     }
 
@@ -1700,6 +1925,7 @@ impl concrete::ConcreteType {
             concrete::ConcreteType::Slice(ty) => ty.span(),
             concrete::ConcreteType::Ref(ty) => ty.span(),
             concrete::ConcreteType::Optional(ty) => ty.span(),
+            concrete::ConcreteType::Range { span, .. } => *span,
         }
     }
 }
@@ -1937,6 +2163,18 @@ impl std::fmt::Display for Type {
                 s.push_str(") -> ");
                 s.push_str(&ret_ty.to_string());
                 s
+            },
+            Type::Range {
+                start,
+                end,
+                inclusive,
+                ..
+            } => {
+                if *inclusive {
+                    format!("{}..={}", start, end)
+                } else {
+                    format!("{}..{}", start, end)
+                }
             },
         })
     }

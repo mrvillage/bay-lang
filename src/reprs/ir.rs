@@ -5,6 +5,7 @@ use dashmap::DashMap;
 use crate::{
     prelude::*,
     store::{InitStore, Store},
+    token::Radix,
 };
 
 pub static mut IR_VALUE_STORE: Option<Store<IrValue>> = None;
@@ -24,8 +25,9 @@ pub enum IrValue {
         expr: Box<Expr>,
     },
     Var {
-        id: u64,
-        ty: &'static IrType,
+        id:     u64,
+        ty:     &'static IrType,
+        offset: u64,
     },
     Fn {
         id:      u64,
@@ -39,7 +41,6 @@ pub enum IrValue {
     },
 }
 
-pub const TMP_VAR_ID: u64 = 1;
 pub const FIRST_NON_RESERVED_IR_VALUE_ID: u64 = 2;
 
 impl InitStore for IrValue {
@@ -87,6 +88,13 @@ pub enum IrType {
         param_tys: Vec<&'static IrType>,
         ret_ty:    &'static IrType,
     },
+    Range {
+        id:        u64,
+        start:     i128,
+        end:       i128,
+        inclusive: bool,
+        universe:  bool,
+    },
 }
 
 impl InitStore for IrType {
@@ -113,6 +121,19 @@ impl std::fmt::Debug for IrType {
             IrType::Ref { id, .. } => write!(f, "Ref<{}>", id),
             IrType::Optional { id, .. } => write!(f, "Optional<{}>", id),
             IrType::Fn { id, .. } => write!(f, "Fn<{}>", id),
+            IrType::Range {
+                id,
+                start,
+                end,
+                inclusive,
+                universe,
+            } => {
+                write!(
+                    f,
+                    "Range<{}> {{ start: {}, end: {}, inclusive: {}, universe: {} }}",
+                    id, start, end, inclusive, universe
+                )
+            },
         }
     }
 }
@@ -132,6 +153,7 @@ impl std::fmt::Display for IrType {
             IrType::Ref { id, .. } => write!(f, "ref<{}>", id),
             IrType::Optional { id, .. } => write!(f, "optional<{}>", id),
             IrType::Fn { id, .. } => write!(f, "fn<{}>", id),
+            IrType::Range { id, .. } => write!(f, "range<{}>", id),
         }
     }
 }
@@ -321,6 +343,7 @@ pub enum Literal {
     F64(f64),
     Bool(bool),
     Nil { ty: &'static IrType },
+    Range { val: i128, ty: &'static IrType },
 }
 
 #[derive(Debug)]
@@ -399,6 +422,7 @@ impl IrType {
             IrType::Ref { id, .. } => *id,
             IrType::Optional { id, .. } => *id,
             IrType::Fn { id, .. } => *id,
+            IrType::Range { id, .. } => *id,
         }
     }
 
@@ -427,6 +451,7 @@ impl IrType {
                 IrType::I32 | IrType::F64 | IrType::Bool | IrType::Never | IrType::Unit => {
                     // primitive types already have ids
                 },
+                IrType::Range { id: ty_id, .. } => *ty_id = id,
             }
             store.items.insert(id, self);
             &*(&*store.items.get(&id).unwrap() as *const IrType)
@@ -475,6 +500,28 @@ impl IrValue {
             }
             store.items.insert(id, self);
             &*(&*store.items.get(&id).unwrap() as *const IrValue)
+        }
+    }
+
+    pub fn offset(&self) -> u64 {
+        match self {
+            IrValue::Var { offset, .. } => *offset,
+            _ => panic!("only variable values have offsets"),
+        }
+    }
+
+    pub fn set_offset(&self, offset: u64) {
+        unsafe {
+            let store = IR_VALUE_STORE.as_ref().unwrap();
+            let ir_val = store.get_mut(self.id()).unwrap();
+            match ir_val {
+                IrValue::Var {
+                    offset: val_offset, ..
+                } => {
+                    *val_offset = offset;
+                },
+                _ => panic!("only variable values have offsets"),
+            }
         }
     }
 }
@@ -548,6 +595,21 @@ impl Type {
                 Type::Module { .. } => {
                     unimplemented!("module types are not supported in IR");
                 },
+                Type::Range {
+                    start,
+                    end,
+                    inclusive,
+                    universe,
+                    ..
+                } => {
+                    IrType::Range {
+                        id:        ir_ty.id(),
+                        start:     *start,
+                        end:       *end,
+                        inclusive: *inclusive,
+                        universe:  *universe,
+                    }
+                },
             };
             ir_ty
         }
@@ -597,8 +659,9 @@ impl Value {
                 },
                 Value::Var { ty, .. } => {
                     IrValue::Var {
-                        id: ir_val.id(),
-                        ty: ty.ty().into_ir(),
+                        id:     ir_val.id(),
+                        ty:     ty.ty().into_ir(),
+                        offset: 0,
                     }
                 },
                 Value::Fn {
@@ -991,9 +1054,44 @@ impl hir::Literal {
             hir::Literal::Int { value, ty, .. } => {
                 match ty.ty() {
                     Type::I32 => {
-                        match value.value.parse::<i32>() {
+                        let s = value.value.replace('_', "");
+                        let res = match value.radix {
+                            #[allow(clippy::from_str_radix_10)]
+                            Radix::Decimal => i32::from_str_radix(&s, 10),
+                            Radix::Hex => i32::from_str_radix(&s[2..], 16),
+                            Radix::Octal => i32::from_str_radix(&s[2..], 8),
+                            Radix::Binary => i32::from_str_radix(&s[2..], 2),
+                        };
+                        match res {
                             Ok(v) => Literal::I32(v),
                             Err(_) => panic!("out of range i32 literal: {}", value.value),
+                        }
+                    },
+                    Type::Range {
+                        start,
+                        end,
+                        inclusive,
+                        ..
+                    } => {
+                        let s = value.value.replace('_', "");
+                        let res = match value.radix {
+                            #[allow(clippy::from_str_radix_10)]
+                            Radix::Decimal => i128::from_str_radix(&s, 10),
+                            Radix::Hex => i128::from_str_radix(&s[2..], 16),
+                            Radix::Octal => i128::from_str_radix(&s[2..], 8),
+                            Radix::Binary => i128::from_str_radix(&s[2..], 2),
+                        };
+                        match res {
+                            Ok(v) => {
+                                if v < *start || v > *end || (!*inclusive && v == *end) {
+                                    panic!("out of range range literal: {}", value.value);
+                                }
+                                Literal::Range {
+                                    val: v,
+                                    ty:  ty.ty().into_ir(),
+                                }
+                            },
+                            Err(_) => panic!("out of range range literal: {}", value.value),
                         }
                     },
                     _ => unimplemented!("only i32 literals are supported in IR"),
@@ -1082,6 +1180,7 @@ impl Expr {
                     Literal::F64 { .. } => &IrType::F64,
                     Literal::Bool { .. } => &IrType::Bool,
                     Literal::Nil { ty, .. } => ty,
+                    Literal::Range { ty, .. } => ty,
                 }
             },
             Expr::Value { value } => value.ty(),

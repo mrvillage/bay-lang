@@ -57,6 +57,12 @@ pub enum HirItem {
         items:      Vec<HirItem>,
         span:       Span,
     },
+    TypeAlias {
+        visibility: Visibility,
+        name:       token::Ident,
+        ty:         MaybeType,
+        span:       Span,
+    },
 }
 
 #[derive(Debug)]
@@ -110,9 +116,10 @@ pub enum HirStmt {
 pub enum Expr {
     Literal(Literal),
     Path {
-        path: concrete::Path,
-        ty:   MaybeType,
-        span: Span,
+        path:  concrete::Path,
+        ty:    MaybeType,
+        span:  Span,
+        scope: &'static Scope,
     },
     Value {
         value: &'static Value,
@@ -453,6 +460,9 @@ impl IntoHir for concrete::Block {
         for stmt in self.stmts {
             match stmt {
                 concrete::Stmt::Let(stmt) => {
+                    // since let statements can introduce new variables, we need to create a new
+                    // scope the new variable
+                    block_scope = block_scope.inherit_all()?;
                     let expr = if let Some(expr) = stmt.expr {
                         Some(Box::new(expr.into_hir(block_scope)?))
                     } else {
@@ -496,9 +506,6 @@ impl IntoHir for concrete::Block {
                         span: stmt.span,
                         value,
                     };
-                    // since let statements can introduce new variables, we need to create a new
-                    // scope for the next statement
-                    block_scope = block_scope.inherit_all()?;
                     stmts.push(hir_stmt);
                 },
                 concrete::Stmt::Expr(expr) => {
@@ -949,6 +956,7 @@ impl IntoHir for concrete::PrimaryExpr {
                     span: path.span,
                     path,
                     ty: MaybeType::Inferred,
+                    scope,
                 })
             },
             concrete::PrimaryExpr::Group { expr, span } => expr.into_hir(scope),
@@ -1078,8 +1086,9 @@ impl IntoHir for concrete::StructExpr {
                                         segments: vec![field.name.clone()],
                                         span:     field.span,
                                     },
-                                    ty:   MaybeType::Inferred,
+                                    ty: MaybeType::Inferred,
                                     span: field.span,
+                                    scope,
                                 }
                             },
                         },
@@ -1232,7 +1241,7 @@ impl Block {
                     }
                     match value {
                         Value::Var { ty: val_ty, .. } => {
-                            ty.reconcile_type(val_ty, *span)?;
+                            ty.reconcile_expected(val_ty, *span)?;
                         },
                         _ => unreachable!(),
                     }
@@ -1242,6 +1251,12 @@ impl Block {
                         inferred |= expr.infer(scope, ty.ty_opt())?;
                         if let MaybeType::Resolved(expr_ty) = expr.ty() {
                             *ty = MaybeType::Resolved(expr_ty);
+                            match value {
+                                Value::Var { ty: val_ty, .. } => {
+                                    *val_ty = MaybeType::Resolved(expr_ty);
+                                },
+                                _ => unreachable!(),
+                            }
                         }
                     }
                 },
@@ -1285,7 +1300,7 @@ impl Block {
             }
             if let Some(expected_ty) = expected {
                 self.ty
-                    .reconcile_type(&mut MaybeType::Resolved(expected_ty), self.span)?;
+                    .reconcile_expected(&mut MaybeType::Resolved(expected_ty), self.span)?;
             }
         }
         Ok(inferred)
@@ -1689,14 +1704,48 @@ impl Literal {
                     _ => None,
                 };
                 if let Some(suffix_ty) = suffix_ty {
-                    ty.reconcile_type(&mut MaybeType::Resolved(suffix_ty), *span)?;
+                    ty.reconcile_expected(&mut MaybeType::Resolved(suffix_ty), *span)?;
                 }
                 if let Some(expected_ty) = expected {
-                    ty.reconcile_type(&mut MaybeType::Resolved(expected_ty), *span)?;
+                    ty.reconcile_expected(&mut MaybeType::Resolved(expected_ty), *span)?;
                 }
                 if let MaybeType::Resolved(t) = ty {
                     match t {
                         Type::I32 => {},
+                        Type::Range {
+                            start,
+                            end,
+                            inclusive,
+                            ..
+                        } => {
+                            let value = value.value()?;
+                            if value < *start {
+                                return Err(CompileError::Error(
+                                    *span,
+                                    format!(
+                                        "integer literal '{}' is less than the start of the range \
+                                         '{}..{}{}'",
+                                        value,
+                                        start,
+                                        end,
+                                        if *inclusive { "=" } else { "" }
+                                    ),
+                                ));
+                            }
+                            if (*inclusive && value > *end) || (!*inclusive && value >= *end) {
+                                return Err(CompileError::Error(
+                                    *span,
+                                    format!(
+                                        "integer literal '{}' is greater than the end of the \
+                                         range '{}..{}{}'",
+                                        value,
+                                        start,
+                                        end,
+                                        if *inclusive { "=" } else { "" }
+                                    ),
+                                ));
+                            }
+                        },
                         _ => {
                             return Err(CompileError::Error(
                                 *span,
@@ -1723,10 +1772,10 @@ impl Literal {
                     _ => None,
                 };
                 if let Some(suffix_ty) = suffix_ty {
-                    ty.reconcile_type(&mut MaybeType::Resolved(suffix_ty), *span)?;
+                    ty.reconcile_expected(&mut MaybeType::Resolved(suffix_ty), *span)?;
                 }
                 if let Some(expected_ty) = expected {
-                    ty.reconcile_type(&mut MaybeType::Resolved(expected_ty), *span)?;
+                    ty.reconcile_expected(&mut MaybeType::Resolved(expected_ty), *span)?;
                 }
                 if let MaybeType::Resolved(t) = ty {
                     match t {
@@ -1745,9 +1794,9 @@ impl Literal {
                 if !ty.is_inferred() {
                     return Ok(false);
                 }
-                ty.reconcile_type(&mut MaybeType::Resolved(&Type::Bool), *span)?;
+                ty.reconcile_expected(&mut MaybeType::Resolved(&Type::Bool), *span)?;
                 if let Some(expected_ty) = expected {
-                    ty.reconcile_type(&mut MaybeType::Resolved(expected_ty), *span)?;
+                    ty.reconcile_expected(&mut MaybeType::Resolved(expected_ty), *span)?;
                 }
                 Ok(!ty.is_inferred())
             },
@@ -1766,7 +1815,7 @@ impl Literal {
                             ))
                         },
                     }
-                    ty.reconcile_type(&mut MaybeType::Resolved(expected_ty), *span)?;
+                    ty.reconcile_expected(&mut MaybeType::Resolved(expected_ty), *span)?;
                 }
                 Ok(!ty.is_inferred())
             },
@@ -1831,12 +1880,16 @@ impl Expr {
             Expr::Literal(literal) => {
                 inferred |= literal.infer(expected)?;
             },
-            Expr::Path { path, ty, span } => {
-                // resolve the path to a value in the scope
+            Expr::Path {
+                path,
+                ty,
+                span,
+                scope,
+            } => {
                 let value = scope.resolve_path_value_mut(path)?;
-                ty.reconcile_type(value.ty_mut(), *span)?;
+                ty.reconcile_expected(value.ty_mut(), *span)?;
                 if let Some(expected_ty) = expected {
-                    ty.reconcile_type(&mut MaybeType::Resolved(expected_ty), *span)?;
+                    ty.reconcile_expected(&mut MaybeType::Resolved(expected_ty), *span)?;
                 }
                 *self = Expr::Value { value, span: *span };
             },
@@ -1845,7 +1898,7 @@ impl Expr {
                     if let Some(expected_ty) = expected {
                         let val_ty =
                             unsafe { &mut *(val_ty as *const MaybeType as *mut MaybeType) };
-                        val_ty.reconcile_type(&mut MaybeType::Resolved(expected_ty), *span)?;
+                        val_ty.reconcile_expected(&mut MaybeType::Resolved(expected_ty), *span)?;
                     }
                 }
             },
@@ -1867,7 +1920,7 @@ impl Expr {
                         for (e, t) in expr.iter_mut().zip(fields.iter()) {
                             inferred |= e.infer(scope, Some(*t))?;
                         }
-                        ty.reconcile_type(&mut MaybeType::Resolved(expected_ty), *span)?;
+                        ty.reconcile_expected(&mut MaybeType::Resolved(expected_ty), *span)?;
                     } else {
                         return Err(CompileError::Error(
                             *span,
@@ -1900,7 +1953,7 @@ impl Expr {
                             fields,
                             scope,
                         })?;
-                        ty.reconcile_type(&mut MaybeType::Resolved(tuple_ty), *span)?;
+                        ty.reconcile_expected(&mut MaybeType::Resolved(tuple_ty), *span)?;
                     }
                 }
             },
@@ -1928,7 +1981,7 @@ impl Expr {
                         for e in elems.iter_mut() {
                             inferred |= e.infer(scope, Some(*elem_ty))?;
                         }
-                        ty.reconcile_type(&mut MaybeType::Resolved(expected_ty), *span)?;
+                        ty.reconcile_expected(&mut MaybeType::Resolved(expected_ty), *span)?;
                     } else {
                         return Err(CompileError::Error(
                             *span,
@@ -1958,7 +2011,7 @@ impl Expr {
                             length: elems.len(),
                             scope,
                         })?;
-                        ty.reconcile_type(&mut MaybeType::Resolved(array_ty), *span)?;
+                        ty.reconcile_expected(&mut MaybeType::Resolved(array_ty), *span)?;
                     }
                 }
             },
@@ -2026,9 +2079,12 @@ impl Expr {
                                             }
                                         }
                                     }
-                                    ty.reconcile_type(&mut MaybeType::Resolved(struct_ty), *span)?;
+                                    ty.reconcile_expected(
+                                        &mut MaybeType::Resolved(struct_ty),
+                                        *span,
+                                    )?;
                                     if let Some(expected_ty) = expected {
-                                        ty.reconcile_type(
+                                        ty.reconcile_expected(
                                             &mut MaybeType::Resolved(expected_ty),
                                             *span,
                                         )?;
@@ -2111,10 +2167,10 @@ impl Expr {
                     None => MaybeType::Inferred,
                 });
                 body.ty
-                    .reconcile_type(&mut MaybeType::Resolved(&Type::Unit), *span)?;
+                    .reconcile_expected(&mut MaybeType::Resolved(&Type::Unit), *span)?;
                 inferred |= body.infer(expected)?;
                 // now, we can reconcile the break type to the body's type
-                ty.reconcile_type(body.scope.break_ty(label.clone()).unwrap(), *span)?;
+                ty.reconcile_expected(body.scope.break_ty(label.clone()).unwrap(), *span)?;
             },
             Expr::For {
                 label,
@@ -2147,10 +2203,10 @@ impl Expr {
                     None => MaybeType::Resolved(&Type::Unit),
                 });
                 body.ty
-                    .reconcile_type(&mut MaybeType::Resolved(&Type::Unit), *span)?;
+                    .reconcile_expected(&mut MaybeType::Resolved(&Type::Unit), *span)?;
                 inferred |= body.infer(expected)?;
                 // now, we can reconcile the break type to the body's type
-                ty.reconcile_type(body.scope.break_ty(label.clone()).unwrap(), *span)?;
+                ty.reconcile_expected(body.scope.break_ty(label.clone()).unwrap(), *span)?;
             },
             Expr::ControlFlow {
                 expr,
@@ -2188,8 +2244,10 @@ impl Expr {
                                 inferred |= e.infer(scope, break_ty.ty_opt())?;
                             } else {
                                 // break with no expression has unit type
-                                break_ty
-                                    .reconcile_type(&mut MaybeType::Resolved(&Type::Unit), *span)?;
+                                break_ty.reconcile_expected(
+                                    &mut MaybeType::Resolved(&Type::Unit),
+                                    *span,
+                                )?;
                             }
                         } else {
                             return Err(CompileError::Error(
@@ -2412,41 +2470,41 @@ impl Expr {
                 if let (MaybeType::Resolved(left_ty), MaybeType::Resolved(right_ty)) =
                     (left.ty(), right.ty())
                 {
-                    ty.reconcile_type(
+                    ty.reconcile_expected(
                         &mut MaybeType::Resolved(left_ty.binary_op(right_ty, op, *span)?),
                         *span,
                     )?;
                 } else {
                     // otherwise, we can use the hint if it exists
                     if let Some(hint_ty) = hint {
-                        ty.reconcile_type(&mut MaybeType::Resolved(hint_ty.1), *span)?;
+                        ty.reconcile_expected(&mut MaybeType::Resolved(hint_ty.1), *span)?;
                     }
                 }
                 if let Some(expected_ty) = expected {
-                    ty.reconcile_type(&mut MaybeType::Resolved(expected_ty), *span)?;
+                    ty.reconcile_expected(&mut MaybeType::Resolved(expected_ty), *span)?;
                 }
             },
             Expr::UnaryOp { op, expr, ty, span } => {
                 inferred |= expr.infer(scope, expected.and_then(|t| t.unary_op_hint(op)))?;
                 if let MaybeType::Resolved(expr_ty) = expr.ty() {
-                    ty.reconcile_type(
+                    ty.reconcile_expected(
                         &mut MaybeType::Resolved(expr_ty.unary_op(op, *span)?),
                         *span,
                     )?;
                 }
                 if let Some(expected_ty) = expected {
-                    ty.reconcile_type(&mut MaybeType::Resolved(expected_ty), *span)?;
+                    ty.reconcile_expected(&mut MaybeType::Resolved(expected_ty), *span)?;
                 }
             },
             Expr::Unwrap { expr, ty, span } => {
                 if let Some(expected_ty) = expected {
-                    ty.reconcile_type(&mut MaybeType::Resolved(expected_ty), *span)?;
+                    ty.reconcile_expected(&mut MaybeType::Resolved(expected_ty), *span)?;
                 }
                 inferred |= expr.infer(scope, None)?;
                 if let MaybeType::Resolved(expr_ty) = expr.ty() {
                     match expr_ty {
                         Type::Optional { ty: inner_ty, .. } => {
-                            ty.reconcile_type(&mut MaybeType::Resolved(inner_ty), *span)?;
+                            ty.reconcile_expected(&mut MaybeType::Resolved(inner_ty), *span)?;
                         },
                         _ => {
                             return Err(CompileError::Error(
@@ -2461,7 +2519,7 @@ impl Expr {
                 if let Some(expected_ty) = expected {
                     match expected_ty {
                         Type::Optional { ty: inner_ty, .. } => {
-                            ty.reconcile_type(&mut MaybeType::Resolved(expected_ty), *span)?;
+                            ty.reconcile_expected(&mut MaybeType::Resolved(expected_ty), *span)?;
                         },
                         _ => {
                             return Err(CompileError::Error(
@@ -2487,7 +2545,7 @@ impl Expr {
                         scope,
                     }
                     .store();
-                    ty.reconcile_type(&mut MaybeType::Resolved(optional_ty), *span)?;
+                    ty.reconcile_expected(&mut MaybeType::Resolved(optional_ty), *span)?;
                 }
             },
             Expr::FieldAccess {
@@ -2510,7 +2568,7 @@ impl Expr {
                                     if let Some(field_ty) =
                                         fields.iter().find(|f| f.name.value == field.value)
                                     {
-                                        ty.reconcile_type(
+                                        ty.reconcile_expected(
                                             &mut MaybeType::Resolved(field_ty.ty.ty()),
                                             *span,
                                         )?;
@@ -2588,11 +2646,12 @@ impl Expr {
                         for (arg, param_ty) in args.iter_mut().zip(param_tys.iter()) {
                             inferred |= arg.infer(scope, Some(*param_ty))?;
                             let span = arg.span();
-                            MaybeType::Resolved(param_ty).reconcile_type(arg.ty_mut(), span)?;
+                            arg.ty_mut()
+                                .reconcile_expected(&mut MaybeType::Resolved(param_ty), span)?;
                         }
-                        ty.reconcile_type(&mut MaybeType::Resolved(ret_ty), *span)?;
+                        ty.reconcile_expected(&mut MaybeType::Resolved(ret_ty), *span)?;
                         if let Some(expected_ty) = expected {
-                            ty.reconcile_type(&mut MaybeType::Resolved(expected_ty), *span)?;
+                            ty.reconcile_expected(&mut MaybeType::Resolved(expected_ty), *span)?;
                         }
                     } else {
                         return Err(CompileError::Error(
@@ -2615,9 +2674,12 @@ impl Expr {
                 if let MaybeType::Resolved(expr_ty) = expr.ty_mut() {
                     match expr_ty {
                         Type::Array { ty: elem_ty, .. } => {
-                            ty.reconcile_type(&mut MaybeType::Resolved(elem_ty), *span)?;
+                            ty.reconcile_expected(&mut MaybeType::Resolved(elem_ty), *span)?;
                             if let Some(expected_ty) = expected {
-                                ty.reconcile_type(&mut MaybeType::Resolved(expected_ty), *span)?;
+                                ty.reconcile_expected(
+                                    &mut MaybeType::Resolved(expected_ty),
+                                    *span,
+                                )?;
                             }
                         },
                         _ => {
@@ -2660,7 +2722,7 @@ impl Expr {
                 }
                 // right now this will only work for nil casts, nothing else can be casted
                 if let Some(expected_ty) = expected {
-                    ty.reconcile_type(&mut MaybeType::Resolved(expected_ty), *span)?;
+                    ty.reconcile_expected(&mut MaybeType::Resolved(expected_ty), *span)?;
                 }
             },
         }
@@ -3282,8 +3344,7 @@ impl If {
             if ty.is_never() {
                 then_is_never = true;
             } else {
-                self.ty
-                    .reconcile_type(&mut MaybeType::Resolved(ty), self.span)?;
+                ty.reconcile_expected(&mut self.ty, self.span)?;
             }
         }
         if let Some(else_block) = &mut self.else_block {
@@ -3304,20 +3365,18 @@ impl If {
                 if ty.is_never() {
                     else_is_never = true;
                 } else {
-                    self.ty
-                        .reconcile_type(&mut MaybeType::Resolved(ty), self.span)?;
+                    ty.reconcile_expected(&mut self.ty, self.span)?;
                 }
             }
         }
         // if both then and else are never, the if is never
         if then_is_never && else_is_never {
-            self.ty
-                .reconcile_type(&mut MaybeType::Resolved(&Type::Never), self.span)?;
+            MaybeType::Resolved(&Type::Never).reconcile_expected(&mut self.ty, self.span)?;
         }
         // finally, reconcile with expected type
         if let Some(expected_ty) = expected {
             self.ty
-                .reconcile_type(&mut MaybeType::Resolved(expected_ty), self.span)?;
+                .reconcile_expected(&mut MaybeType::Resolved(expected_ty), self.span)?;
         }
         Ok(inferred)
     }

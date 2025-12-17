@@ -196,6 +196,26 @@ impl IntLiteral {
             },
         }
     }
+
+    pub fn value(&self) -> Result<i128> {
+        let value = self.value.replace('_', "");
+        let res = match self.radix {
+            #[allow(clippy::from_str_radix_10)]
+            Radix::Decimal => i128::from_str_radix(&value, 10),
+            Radix::Hex => i128::from_str_radix(&value[2..], 16),
+            Radix::Octal => i128::from_str_radix(&value[2..], 8),
+            Radix::Binary => i128::from_str_radix(&value[2..], 2),
+        };
+        match res {
+            Ok(v) => Ok(v),
+            Err(_) => {
+                Err(CompileError::Error(
+                    self.span,
+                    "invalid integer literal".to_string(),
+                ))
+            },
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

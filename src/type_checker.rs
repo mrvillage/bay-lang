@@ -1,3 +1,4 @@
+use dashmap::DashMap;
 use hir::*;
 
 use crate::{concrete::Visibility, prelude::*};
@@ -17,6 +18,28 @@ pub fn type_check(source: concrete::Source) -> Result<()> {
     infer_types()?;
     // 6. finally, we check ownership rules
     check_ownership()?;
+    // for ty in Type::all() {
+    //     println!("Type {:#?}", ty);
+    // }
+    // for val in Value::all() {
+    //     println!("Value {:?}", val);
+    //     #[allow(unused)]
+    //     if let Value::Fn {
+    //         params,
+    //         ret_ty,
+    //         body,
+    //         ..
+    //     } = val
+    //     {
+    //         println!("Params:");
+    //         for (name, _, value) in params {
+    //             println!("  {}: {:#?}", name.value, value);
+    //         }
+    //         println!("Return Type: {:#?}", ret_ty);
+    //         println!("Body: {:#?}", body);
+    //     }
+    //     println!("---");
+    // }
     Ok(())
 }
 
@@ -68,6 +91,47 @@ fn to_hir(source: concrete::Source) -> Result<&'static Scope> {
                     span:  Span::dummy(),
                 },
                 MaybeType::Resolved(&Type::I32),
+                None,
+            )],
+            scope,
+            body: Box::new(hir::Block {
+                stmts: vec![],
+                span: Span::dummy(),
+                ty: MaybeType::Inferred,
+                scope,
+            }),
+            ty: MaybeType::Inferred,
+        },
+    )?;
+    let scope = global_root.inherit_all()?;
+    global_root.new_value(
+        token::Ident {
+            value: "print",
+            span:  Span::dummy(),
+        },
+        Value::Fn {
+            id: PRINT_WORDS_VALUE_ID,
+            visibility: Visibility::Public,
+            name: token::Ident {
+                value: "print",
+                span:  Span::dummy(),
+            },
+            ret_ty: MaybeType::Resolved(&Type::Unit),
+            params: vec![(
+                token::Ident {
+                    value: "value",
+                    span:  Span::dummy(),
+                },
+                MaybeType::Resolved(
+                    Type::Range {
+                        id:        0,
+                        start:     i128::MIN,
+                        end:       i128::MAX,
+                        inclusive: true,
+                        universe:  true,
+                    }
+                    .store(),
+                ),
                 None,
             )],
             scope,
@@ -172,6 +236,9 @@ fn item_to_scope(item: concrete::Item, scope: &'static Scope) -> Result<()> {
                 item_to_scope(item, module_scope)?;
             }
         },
+        concrete::Item::TypeAlias(item) => {
+            scope.new_alias(item.name, item.ty)?;
+        },
     }
     Ok(())
 }
@@ -189,12 +256,29 @@ fn resolve_use_items() -> Result<()> {
 }
 
 fn resolve_paths_and_types() -> Result<()> {
+    for sc in Scope::all() {
+        // first, we resolve all type aliases, since all names are defined at this point
+        unsafe {
+            let store = SCOPE_STORE.as_ref().unwrap();
+            let mut scope = store.items.get_mut(&sc.id).unwrap();
+            if scope.type_ns.is_none() {
+                scope.type_ns = Some(DashMap::new());
+            }
+            if let Some(alias) = &sc.unresolved_aliases {
+                for r in alias {
+                    let (name, ty) = r.pair();
+                    let resolved_ty = ty.resolve_type(sc)?;
+                    scope.type_ns.as_ref().unwrap().insert(name, resolved_ty);
+                }
+            }
+        }
+    }
     for ty in Type::all_mut() {
-        // first, we resolve all paths in types
+        // then, we resolve all paths in types
         ty.resolve_explicit()?;
     }
     for val in Value::all_mut() {
-        // then we resolve all paths in values
+        // finally, we resolve all paths in values
         val.resolve_explicit()?;
     }
     Ok(())

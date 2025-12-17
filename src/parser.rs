@@ -194,11 +194,13 @@ impl Parse for Item {
             return ConstItem::parse(cursor).map(Item::Const);
         } else if fork.consume_keyword(Keyword::Mod).is_ok() {
             return ModItem::parse(cursor).map(Item::Mod);
+        } else if fork.consume_keyword(Keyword::Type).is_ok() {
+            return TypeAliasItem::parse(cursor).map(Item::TypeAlias);
         }
 
         if let Some(token) = cursor.peek() {
             token.unexpected_token(Some(
-                "one of `use`, `fn`, `struct`, `enum`, `const`, or `mod`".to_string(),
+                "one of `use`, `fn`, `struct`, `enum`, `const`, `mod`, or `type`".to_string(),
             ))
         } else {
             cursor.unexpected_end_of_input()
@@ -213,6 +215,7 @@ impl Parse for Item {
             Item::Enum(item) => item.unparse(),
             Item::Const(item) => item.unparse(),
             Item::Mod(item) => item.unparse(),
+            Item::TypeAlias(item) => item.unparse(),
         }
     }
 }
@@ -840,6 +843,36 @@ impl Parse for ModItem {
     }
 }
 
+impl Parse for TypeAliasItem {
+    fn parse(cursor: &mut Cursor) -> Result<Self> {
+        let Some(span) = cursor.peek().map(|t| t.span()) else {
+            return cursor.unexpected_end_of_input();
+        };
+        let visibility = Option::<Visibility>::parse(cursor)?;
+        cursor.consume_keyword(Keyword::Type)?;
+        let name = cursor.consume_ident()?.clone();
+        cursor.consume_symbol(Symbol::Equal)?;
+        let ty = ConcreteType::parse(cursor)?;
+        let token = cursor.consume_symbol(Symbol::Semicolon)?;
+        let span = span.join(token.span);
+        Ok(TypeAliasItem {
+            visibility,
+            name,
+            ty,
+            span,
+        })
+    }
+
+    fn unparse(&self) -> String {
+        format!(
+            "{}type {} = {};",
+            self.visibility.unparse(),
+            self.name.value,
+            self.ty.unparse()
+        )
+    }
+}
+
 impl Parse for Block {
     fn parse(cursor: &mut Cursor) -> Result<Self> {
         let Some(span) = cursor.peek().map(|t| t.span()) else {
@@ -912,6 +945,10 @@ impl Parse for Stmt {
                 ConstItem::parse(cursor).map(Item::Const).map(Stmt::Item)
             } else if fork.consume_keyword(Keyword::Mod).is_ok() {
                 ModItem::parse(cursor).map(Item::Mod).map(Stmt::Item)
+            } else if fork.consume_keyword(Keyword::Type).is_ok() {
+                TypeAliasItem::parse(cursor)
+                    .map(Item::TypeAlias)
+                    .map(Stmt::Item)
             } else {
                 let expr = Expr::parse(cursor)?;
                 if cursor.consume_symbol(Symbol::Semicolon).is_ok() {
@@ -1181,6 +1218,58 @@ impl Parse for ConcreteType {
             }
             ConcreteType::Tuple(elements)
         } else {
+            // check if it's a range type
+            let mut fork = cursor.fork();
+            let Some(span) = cursor.peek().map(|t| t.span()) else {
+                return cursor.unexpected_end_of_input();
+            };
+            let start_neg = fork.consume_symbol(Symbol::Minus).is_ok();
+            if let Ok(TokenLiteral::Int(start)) = fork.consume_literal() {
+                let inclusive = if fork.consume_symbol(Symbol::DotDotEqual).is_ok() {
+                    true
+                } else if fork.consume_symbol(Symbol::DotDot).is_ok() {
+                    false
+                } else {
+                    return Path::parse(cursor).map(ConcreteType::Path);
+                };
+                let end_neg = fork.consume_symbol(Symbol::Minus).is_ok();
+                let Ok(TokenLiteral::Int(end)) = fork.consume_literal() else {
+                    return Path::parse(cursor).map(ConcreteType::Path);
+                };
+                cursor.unfork(fork);
+                let Ok(start) = start.value() else {
+                    return Err(CompileError::Error(
+                        start.span,
+                        "invalid integer literal for range start".to_string(),
+                    ));
+                };
+                let start = if start_neg { -start } else { start };
+                let Ok(end) = end.value() else {
+                    return Err(CompileError::Error(
+                        end.span,
+                        "invalid integer literal for range end".to_string(),
+                    ));
+                };
+                let end = if end_neg { -end } else { end };
+                if start > end {
+                    return Err(CompileError::Error(
+                        span.join(cursor.prev_span()),
+                        "range start must be less than or equal to range end".to_string(),
+                    ));
+                }
+                if start == end && !inclusive {
+                    return Err(CompileError::Error(
+                        span.join(cursor.prev_span()),
+                        "range start and end cannot be equal for exclusive ranges".to_string(),
+                    ));
+                }
+                return Ok(ConcreteType::Range {
+                    start,
+                    end,
+                    inclusive,
+                    span: span.join(cursor.prev_span()),
+                });
+            }
             // path type
             let path = Path::parse(cursor)?;
             ConcreteType::Path(path)
@@ -1207,6 +1296,14 @@ impl Parse for ConcreteType {
             },
             ConcreteType::Path(path) => path.unparse(),
             ConcreteType::Optional(ty) => format!("{}?", ty.unparse()),
+            ConcreteType::Range {
+                start,
+                end,
+                inclusive,
+                ..
+            } => {
+                format!("{}..{}{}", start, if *inclusive { "=" } else { "" }, end,)
+            },
         }
     }
 }

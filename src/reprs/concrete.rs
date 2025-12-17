@@ -15,8 +15,8 @@ pub enum Item {
     Const(ConstItem),
     // Static(StaticItem),
     // Trait(TraitItem),
-    // TypeAlias(TypeAliasItem),
     Mod(ModItem),
+    TypeAlias(TypeAliasItem),
 }
 
 #[derive(Debug, Clone)]
@@ -132,6 +132,14 @@ pub struct ModItem {
     pub inline:     bool,
 }
 
+#[derive(Debug, Clone)]
+pub struct TypeAliasItem {
+    pub visibility: Option<Visibility>,
+    pub name:       token::Ident,
+    pub ty:         ConcreteType,
+    pub span:       Span,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Visibility {
     Public,
@@ -157,6 +165,12 @@ pub enum ConcreteType {
     Slice(Box<ConcreteType>),
     Ref(Box<ConcreteType>),
     Optional(Box<ConcreteType>),
+    Range {
+        start:     i128,
+        end:       i128,
+        inclusive: bool,
+        span:      Span,
+    },
 }
 
 #[derive(Debug, Clone)]
